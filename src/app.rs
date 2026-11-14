@@ -145,10 +145,17 @@ impl App {
         } else {
             cc.storage.and_then(|s| eframe::get_value(s, "jagt")).unwrap_or_default()
         };
-        set_glow(saved.glow);
-
         let lib_path = model::library_path();
         let (lib, problem) = model::load(&lib_path);
+        let mut app = Self::build(&cc.egui_ctx, saved, lib, lib_path, !opts.fresh, opts.open_settings);
+        if let Some(msg) = problem {
+            app.set_status_for(msg, 12.0);
+        }
+        app
+    }
+
+    fn build(ctx: &egui::Context, saved: Saved, lib: Library, lib_path: PathBuf, persist: bool, open_settings: bool) -> Self {
+        set_glow(saved.glow);
         let h = hash_lib(&lib);
         let mut app = App {
             lib,
@@ -164,7 +171,7 @@ impl App {
             search: String::new(),
             online_on: saved.online,
             glow: saved.glow,
-            online: Online::new(cc.egui_ctx.clone()),
+            online: Online::new(ctx.clone()),
             favicons: HashMap::new(),
             expanded: HashSet::new(),
             new_url: String::new(),
@@ -189,22 +196,19 @@ impl App {
             file_mtime: None,
             last_file_check: 0.0,
             add_game: None,
-            show_settings: opts.open_settings,
+            show_settings: open_settings,
             status: None,
             started: Instant::now(),
             window_size: saved.window_size.map(Vec2::from),
             maximized: saved.maximized,
             restore_window: Some((saved.window_size, saved.maximized)),
             restore_wait: 0,
-            persist: !opts.fresh,
+            persist,
         };
         app.file_mtime = mtime(&app.lib_path);
         app.snapshot = app.lib.clone();
         if app.selected.is_none_or(|id| !app.lib.games.iter().any(|g| g.id == id)) {
             app.selected = app.sorted_ids().first().copied();
-        }
-        if let Some(msg) = problem {
-            app.set_status_for(msg, 12.0);
         }
         app
     }
@@ -519,12 +523,10 @@ impl App {
     // Games list (left)
 
     fn games_view(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search games…").desired_width(ui.available_width() - 64.0));
-            if ui.button("+ Add").clicked() {
-                self.add_game = Some(NewGame { title: String::new(), platform: String::new(), status: self.filter.unwrap_or(Status::Playing), focus: true });
-            }
-        });
+        let (_, add, _) = input_row(ui, &mut self.search, "Search games…", "search-games", "+ Add");
+        if add {
+            self.add_game = Some(NewGame { title: String::new(), platform: String::new(), status: self.filter.unwrap_or(Status::Playing), focus: true });
+        }
         let ids = self.sorted_ids();
         if ids.is_empty() {
             ui.add_space(20.0);
@@ -671,25 +673,18 @@ impl App {
     }
 
     fn guides_view(&mut self, ui: &mut Ui, gid: u64, max_h: f32) {
-        ui.horizontal(|ui| {
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut self.new_url)
-                    .hint_text("Paste a guide link: website, spreadsheet, YouTube…")
-                    .desired_width(ui.available_width() - 100.0),
-            );
-            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            if (ui.button("+ Add guide").clicked() || enter) && !self.new_url.trim().is_empty() {
-                let text = std::mem::take(&mut self.new_url);
-                let found = links::extract_all(&text);
-                let added = found.iter().filter(|l| self.add_guide(l)).count();
-                if found.is_empty() {
-                    self.set_status("That doesn't look like a link");
-                    self.new_url = text;
-                } else if found.len() > 1 {
-                    self.set_status(format!("Added {added} of {} links", found.len()));
-                }
+        let (_, add, enter) = input_row(ui, &mut self.new_url, "Paste a guide link: website, spreadsheet, YouTube…", "new-guide", "+ Add guide");
+        if (add || enter) && !self.new_url.trim().is_empty() {
+            let text = std::mem::take(&mut self.new_url);
+            let found = links::extract_all(&text);
+            let added = found.iter().filter(|l| self.add_guide(l)).count();
+            if found.is_empty() {
+                self.set_status("That doesn't look like a link");
+                self.new_url = text;
+            } else if found.len() > 1 {
+                self.set_status(format!("Added {added} of {} links", found.len()));
             }
-        });
+        }
         ui.add_space(4.0);
 
         let Some(game) = self.lib.games.iter().find(|g| g.id == gid) else { return };
@@ -1197,7 +1192,8 @@ impl App {
                 .desired_width(f32::INFINITY),
         );
         let mut logged = false;
-        ui.horizontal(|ui| {
+        // wraps instead of overflowing when the panel is narrow
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(!g.resume_note.trim().is_empty(), egui::Button::new("Save to log"))
                 .on_hover_text("Copy this note into the session log with today's date")
@@ -1218,14 +1214,11 @@ impl App {
 
     fn log_view(&mut self, ui: &mut Ui, gid: u64) {
         let Some(g) = self.lib.game_mut(gid) else { return };
-        ui.horizontal(|ui| {
-            let r = ui.add(egui::TextEdit::singleline(&mut self.new_log).hint_text("What happened this session?").desired_width(ui.available_width() - 50.0));
-            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            if (ui.button("Add").clicked() || enter) && !self.new_log.trim().is_empty() {
-                g.log.push(LogEntry { at: model::now(), text: std::mem::take(&mut self.new_log).trim().to_string() });
-                g.touch();
-            }
-        });
+        let (_, add, enter) = input_row(ui, &mut self.new_log, "What happened this session?", ("new-log", gid), "Add");
+        if (add || enter) && !self.new_log.trim().is_empty() {
+            g.log.push(LogEntry { at: model::now(), text: std::mem::take(&mut self.new_log).trim().to_string() });
+            g.touch();
+        }
         ui.separator();
         if g.log.is_empty() {
             ui.label(RichText::new("Nothing logged yet. Each entry is dated, so you can see what you did last time.").small().color(DIM));
@@ -1637,8 +1630,9 @@ impl App {
     }
 }
 
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl App {
+    /// Draws one frame. Separate from eframe's `update` so tests can drive the real UI.
+    fn frame(&mut self, ctx: &egui::Context) {
         self.track_window(ctx);
         let now = self.time();
         let had_input = ctx.input(|i| !i.events.is_empty() || i.pointer.any_down());
@@ -1660,15 +1654,17 @@ impl eframe::App for App {
 
         let pad = egui::Frame::new().inner_margin(egui::Margin::same(10));
         egui::SidePanel::left("games").resizable(true).default_width(300.0).width_range(220.0..=460.0).frame(pad).show(ctx, |ui| {
-            window(ui, "Games", |ui| self.games_view(ui));
+            contained(ui, |ui| window(ui, "Games", |ui| self.games_view(ui)));
         });
 
         let gid = self.selected.filter(|id| self.lib.games.iter().any(|g| g.id == *id));
         if let Some(gid) = gid {
             egui::SidePanel::right("journal").resizable(true).default_width(330.0).width_range(260.0..=520.0).frame(pad).show(ctx, |ui| {
-                window(ui, "Where I Left Off", |ui| self.resume_view(ui, gid));
-                ui.add_space(12.0);
-                window(ui, "Session Log", |ui| self.log_view(ui, gid));
+                contained(ui, |ui| {
+                    window(ui, "Where I Left Off", |ui| self.resume_view(ui, gid));
+                    ui.add_space(12.0);
+                    window(ui, "Session Log", |ui| self.log_view(ui, gid));
+                });
             });
         }
 
@@ -1728,6 +1724,13 @@ impl eframe::App for App {
 
         // A slow tick keeps the stars drifting and lets the autosave timer fire.
         ctx.request_repaint_after(std::time::Duration::from_millis(66));
+    }
+
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame(ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -2230,18 +2233,15 @@ fn step_row(ui: &mut Ui, s: &Step, i: usize, state: StepState, is_next: bool, ca
 
 /// "Add an item" box at the bottom of a checklist. New items go in the last area.
 fn add_item_row(ui: &mut Ui, g: &mut Guide, buf: &mut String) {
-    ui.horizontal(|ui| {
-        let r = ui.add(egui::TextEdit::singleline(buf).id_salt(("new-step", g.id)).desired_width(ui.available_width() - 70.0).hint_text("Add an item: chapter, collectible, trophy…"));
-        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-        if (ui.button("+ Add").clicked() || enter) && !buf.trim().is_empty() {
-            let section = g.steps.last().map(|s| s.section.clone()).unwrap_or_default();
-            g.steps.push(Step { section, ..Step::task(checklist::plain_item(buf)) });
-            buf.clear();
-            if enter {
-                r.request_focus();
-            }
+    let (r, add, enter) = input_row(ui, buf, "Add an item: chapter, collectible, trophy…", ("new-step", g.id), "+ Add");
+    if (add || enter) && !buf.trim().is_empty() {
+        let section = g.steps.last().map(|s| s.section.clone()).unwrap_or_default();
+        g.steps.push(Step { section, ..Step::task(checklist::plain_item(buf)) });
+        buf.clear();
+        if enter {
+            r.request_focus();
         }
-    });
+    }
 }
 
 /// Two-step button so a stray click can't delete things: the first click arms it for 3 s.
@@ -2259,6 +2259,35 @@ fn armed_button(ui: &mut Ui, key: impl Hash, label: &str, now: f64) -> bool {
         }
     }
     fire
+}
+
+/// A text box that fills the row, with a button at its right end. The button is laid out first
+/// so the box takes exactly the space left: the row can never be wider than where it sits.
+/// Returns (text box, button clicked, Enter pressed in the box).
+fn input_row(ui: &mut Ui, buf: &mut String, hint: &str, id: impl Hash, button: &str) -> (egui::Response, bool, bool) {
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        let clicked = ui.button(button).clicked();
+        let r = ui.add(egui::TextEdit::singleline(buf).id_salt(id).hint_text(hint).desired_width(ui.available_width()));
+        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+        (r, clicked, enter)
+    })
+    .inner
+}
+
+/// Draws `add_contents` in a box exactly the size of the space left in `ui`, and reports
+/// exactly that size back, however wide the contents turn out.
+///
+/// A resizable side panel remembers its width as the width of whatever was drawn in it. Without
+/// this, any row that's a few pixels too wide (a button row, a long title) makes the panel grow
+/// on its own and snap back when you drag it narrower. Overflow is clipped instead.
+fn contained(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
+    let rect = ui.available_rect_before_wrap();
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(*ui.layout()));
+    child.set_clip_rect(rect.intersect(ui.clip_rect()));
+    add_contents(&mut child);
+    #[cfg(test)]
+    tests::OVERFLOW.with(|o| o.set(o.get().max(child.min_rect().width() - rect.width())));
+    ui.allocate_rect(rect, Sense::hover());
 }
 
 fn vline(ui: &mut Ui) {
@@ -2296,4 +2325,139 @@ fn desktop_icon(ui: &mut Ui, which: Option<Status>, active: bool, count: usize) 
         None => format!("All games ({count})"),
         Some(s) => format!("{} ({count})", s.label()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::containers::panel::PanelState;
+
+    thread_local! {
+        /// How far side-panel contents ran past the panel's edge (see `contained`).
+        pub static OVERFLOW: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+    }
+
+    /// A library with long titles, notes and button rows: the kind of content that used to
+    /// push the side panels wider than you set them.
+    fn sample() -> Library {
+        let mut lib = Library::default();
+        let steps = (0..40)
+            .map(|i| Step {
+                text: format!("Objective {i}: A rather long objective name that keeps going and going"),
+                section: format!("Area {} (cleared data, part 2)", i / 10),
+                detail: "Do the thing in the place with the other thing, then come back.".into(),
+                how: "A long explanation of how to do it. ".repeat(6),
+                reward: "Lustrous Arm Guards".into(),
+                deadline: if i % 3 == 0 { "9/25".into() } else { String::new() },
+                optional: i % 4 == 0,
+                done: i < 12,
+                ..Default::default()
+            })
+            .collect();
+        let guide = Guide {
+            id: 2,
+            title: "An extremely long guide title | With A Site Name | And Even More Words In It".into(),
+            url: "https://example.com/a/very/long/guide/address/that/goes/on".into(),
+            steps,
+            ..Default::default()
+        };
+        let link = Guide { id: 3, title: "Reference link with a long name too".into(), url: "https://example.org/x".into(), ..Default::default() };
+        lib.games.push(Game {
+            id: 1,
+            title: "KINGDOM HEARTS HD 2.8 Final Chapter Prologue With Extra Words".into(),
+            platform: "PC (Steam)".into(),
+            resume_note: "Where I left off: ".repeat(20),
+            log: (0..5).map(|i| LogEntry { at: 1_700_000_000 + i * 86_400, text: "Session notes that are fairly long. ".repeat(4) }).collect(),
+            guides: vec![guide, link],
+            game_date: "4/2".into(),
+            ..Default::default()
+        });
+        lib.games.push(Game { id: 4, title: "Fire Emblem: Fortune's Weave".into(), platform: "Switch 2".into(), ..Default::default() });
+        lib.next_id = 10;
+        lib
+    }
+
+    fn app(ctx: &egui::Context) -> App {
+        install(ctx);
+        let saved = Saved { online: false, selected: Some(1), ..Default::default() };
+        let nowhere = std::env::temp_dir().join("jagt-test-does-not-exist").join("library.json");
+        App::build(ctx, saved, sample(), nowhere, false, false)
+    }
+
+    fn run(app: &mut App, ctx: &egui::Context, size: Vec2, events: Vec<egui::Event>) {
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)), events, ..Default::default() };
+        let _ = ctx.run(input, |ctx| app.frame(ctx));
+    }
+
+    fn width(ctx: &egui::Context, id: &str) -> f32 {
+        PanelState::load(ctx, egui::Id::new(id)).expect("panel shown").rect.width()
+    }
+
+    fn drag(app: &mut App, ctx: &egui::Context, size: Vec2, from: Pos2, to: Pos2) {
+        let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        run(app, ctx, size, vec![egui::Event::PointerMoved(from)]);
+        run(app, ctx, size, vec![button(from, true)]);
+        for k in 1..=6 {
+            run(app, ctx, size, vec![egui::Event::PointerMoved(from.lerp(to, k as f32 / 6.0))]);
+        }
+        run(app, ctx, size, vec![button(to, false)]);
+        run(app, ctx, size, vec![egui::Event::PointerGone]);
+    }
+
+    #[test]
+    fn side_panels_stay_where_you_put_them() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let size = Vec2::new(1400.0, 850.0);
+        for _ in 0..5 {
+            run(&mut app, &ctx, size, vec![]);
+        }
+        let (left, right) = (width(&ctx, "games"), width(&ctx, "journal"));
+
+        // left alone, nothing creeps
+        for _ in 0..30 {
+            run(&mut app, &ctx, size, vec![]);
+        }
+        assert_eq!((width(&ctx, "games"), width(&ctx, "journal")), (left, right), "panels changed width on their own");
+
+        // drag the Games panel's edge 70px left: it stays there
+        drag(&mut app, &ctx, size, Pos2::new(left, 400.0), Pos2::new(left - 70.0, 400.0));
+        for _ in 0..10 {
+            run(&mut app, &ctx, size, vec![]);
+        }
+        let want = left - 70.0;
+        assert!((width(&ctx, "games") - want).abs() <= 2.0, "Games panel snapped to {} after dragging to {want}", width(&ctx, "games"));
+
+        // drag the journal panel's edge 70px right: it stays there
+        let edge = size.x - right;
+        drag(&mut app, &ctx, size, Pos2::new(edge, 400.0), Pos2::new(edge + 70.0, 400.0));
+        for _ in 0..10 {
+            run(&mut app, &ctx, size, vec![]);
+        }
+        let want = right - 70.0;
+        assert!((width(&ctx, "journal") - want).abs() <= 2.0, "journal panel snapped to {} after dragging to {want}", width(&ctx, "journal"));
+
+        // squeeze the Games panel to its minimum: it stops there and its contents still fit
+        let now = width(&ctx, "games");
+        drag(&mut app, &ctx, size, Pos2::new(now, 400.0), Pos2::new(60.0, 400.0));
+        for _ in 0..10 {
+            run(&mut app, &ctx, size, vec![]);
+        }
+        assert!((width(&ctx, "games") - 220.0).abs() <= 1.0, "Games panel at {} instead of its 220 minimum", width(&ctx, "games"));
+
+        // shrinking the whole window doesn't make the panels jump around
+        let small = Vec2::new(1000.0, 700.0);
+        for _ in 0..10 {
+            run(&mut app, &ctx, small, vec![]);
+        }
+        let settled = (width(&ctx, "games"), width(&ctx, "journal"));
+        for _ in 0..20 {
+            run(&mut app, &ctx, small, vec![]);
+        }
+        assert_eq!((width(&ctx, "games"), width(&ctx, "journal")), settled, "panels kept moving after the window was resized");
+
+        // and nothing drawn in a side panel is wider than the panel (it would be cut off)
+        let over = OVERFLOW.with(|o| o.get());
+        assert!(over <= 0.5, "side panel content is {over:.1}px wider than its panel");
+    }
 }
