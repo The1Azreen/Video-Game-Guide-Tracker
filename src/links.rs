@@ -246,7 +246,9 @@ pub fn resume_url(g: &Guide) -> String {
         return assemble(base, query, &frag);
     }
     if !is_google_sheet(url) && g.kind != Kind::Video {
-        return with_text(url, &g.jump_text);
+        // multi-page guides reopen the page your next item is on
+        let page = if g.resume_page.trim().is_empty() { url } else { g.resume_page.trim() };
+        return with_text(page, &g.jump_text);
     }
     url.to_string()
 }
@@ -407,6 +409,14 @@ mod tests {
         assert_eq!(normalize(s).as_deref(), Some(url.as_str()));
         let all = extract_all(&format!("Btw https://www.neoseeker.com/x/walkthrough , {s} , {s}"));
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn multi_page_resume() {
+        let mut g = guide("https://example.com/walkthrough");
+        g.steps = vec![crate::model::Step { text: "Talk to Rin".into(), anchor: "Talk to Rin".into(), url: "https://example.com/week-1".into(), ..Default::default() }];
+        g.follow_checklist(None);
+        assert_eq!(resume_url(&g), "https://example.com/week-1#:~:text=Talk%20to%20Rin");
     }
 
     #[test]

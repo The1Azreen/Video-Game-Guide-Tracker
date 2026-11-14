@@ -15,6 +15,7 @@ jagt [options]
   --settings    open the settings window at start
   --size WxH    initial window size
   --parse-checklist FILE   print the checklist parsed from FILE as JSON, then quit
+  --html-to-text FILE      print the text that Fetch-from-guide-page reads from a saved page
   -h, --help    this text";
 
 fn main() -> eframe::Result {
@@ -34,6 +35,12 @@ fn main() -> eframe::Result {
                 // Developer helper: print what a pasted guide turns into, as JSON.
                 let text = args.next().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
                 println!("{}", serde_json::to_string_pretty(&checklist::parse(&text)).unwrap_or_default());
+                return Ok(());
+            }
+            "--html-to-text" => {
+                // Developer helper: what "Fetch from guide page" reads from a saved page.
+                let html = args.next().and_then(|f| std::fs::read(f).ok()).unwrap_or_default();
+                println!("{}", online::html_to_text(&String::from_utf8_lossy(&html)));
                 return Ok(());
             }
             "-h" | "--help" => {

@@ -28,9 +28,22 @@ If you paste a link that already has `&t=95s` or `#range=A40` in it, JAGT keeps 
   splits it into areas (with their own counts, foldable), and items: chests, objectives,
   achievements, quests. Each item keeps its requirement, **How** and **Reward**. A plain list
   (one item per line) works too.
-  - Filter by type, hide finished items, search, and **Go to next** to jump to the next unticked item.
+  - **Fetch from guide page** reads the checklist straight from the guide's link (works for Steam
+    guides, RPG Site and most text guides; sites that block automated reading still need copy-paste).
+    For prose walkthroughs, "Use only the page's headings" makes one item per chapter or section.
+  - Filter by type or by **Story / Optional**, hide finished items, search, and **Go to next**.
+  - **What's left**: what's still to do, area by area. Click an item to tick it, or "Show these" to
+    open the list at that area.
   - **Find in guide** opens the guide page scrolled to that item.
-  - Resume follows the checklist: it opens the guide at your next unticked item.
+  - Resume follows the story: it opens the guide at your next unticked story item, then optional
+    ones once the story is done.
+- **Missable deadlines**: items can have an end date (from `End: 9/25` lines in a guide). Set the
+  game's **In-game date** and items due within two weeks are highlighted, while ones past their
+  date count as missed and stop counting against your progress. Right-click any item to mark it
+  missed/skipped, or to switch it between story and optional.
+- **Undo / Redo** (<kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Y</kbd>) for ticks, deletes and
+  any other change, outside text boxes.
+- **Reference links** (guides without a checklist) take one line; click the arrow for the full card.
 - **Suspended tabs**: links from tab-suspender extensions (`chrome-extension://…/suspended.html#…&uri=…`)
   are unwrapped to the real page, keeping its title. Paste several links at once to add them all.
 - **Where I Left Off**: a note per game for "what was I about to do?", plus a dated **Session Log**.

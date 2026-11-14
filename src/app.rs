@@ -8,13 +8,14 @@ use egui::{Align, Align2, Color32, Key, Layout, Pos2, Rect, RichText, Sense, Str
 use crate::icons;
 use crate::links;
 use crate::checklist;
-use crate::model::{self, Game, Guide, Kind, Library, LogEntry, Status, Step, StepKind};
+use crate::model::{self, Game, Guide, Kind, Library, LogEntry, Status, Step, StepKind, StepState};
 use crate::online::{self, Done, Job, Online};
 use crate::theme::*;
 
 const GAME_ROW_H: f32 = 48.0;
 const CARD_BG: Color32 = Color32::from_rgb(0x22, 0x20, 0x3a);
 const HOVER_BG: Color32 = Color32::from_rgb(0x2a, 0x22, 0x50);
+const GREEN: Color32 = Color32::from_rgb(0x8C, 0xF0, 0x8C);
 
 #[derive(Default)]
 pub struct Options {
@@ -67,6 +68,8 @@ enum CardAct {
 /// What a checklist row asks for.
 enum RowAct {
     Toggle,
+    Missed,
+    Optional,
     Find,
     Delete,
     Up,
@@ -95,13 +98,26 @@ pub struct App {
     step_bufs: HashMap<u64, String>,
     bulk: Option<(u64, String)>,
     bulk_replace: bool,
+    bulk_fetching: bool,
+    bulk_error: Option<String>,
+    bulk_headings: bool,
+    /// (hash of text + mode, parsed items) for the paste window's preview.
+    bulk_cache: Option<(u64, Vec<Step>)>,
     active_list: Option<u64>,
     list_kind: Option<StepKind>,
+    /// Some(false) = story items only, Some(true) = optional only.
+    list_scope: Option<bool>,
+    list_section: Option<String>,
+    left_view: bool,
     hide_done: bool,
     list_search: String,
     collapsed: HashSet<(u64, String)>,
     scroll_to_next: bool,
     file_mtime: Option<std::time::SystemTime>,
+    undo: Vec<Library>,
+    redo: Vec<Library>,
+    /// The library as of the last change, pushed onto `undo` when the next edit begins.
+    snapshot: Library,
     last_file_check: f64,
     add_game: Option<NewGame>,
     show_settings: bool,
@@ -138,6 +154,9 @@ impl App {
             lib,
             lib_path,
             saved_hash: h,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            snapshot: Library::default(),
             last_hash: h,
             changed_at: 0.0,
             selected: saved.selected,
@@ -154,8 +173,15 @@ impl App {
             step_bufs: HashMap::new(),
             bulk: None,
             bulk_replace: false,
+            bulk_fetching: false,
+            bulk_error: None,
+            bulk_headings: false,
+            bulk_cache: None,
             active_list: None,
             list_kind: None,
+            list_scope: None,
+            list_section: None,
+            left_view: false,
             hide_done: false,
             list_search: String::new(),
             collapsed: HashSet::new(),
@@ -173,6 +199,7 @@ impl App {
             persist: !opts.fresh,
         };
         app.file_mtime = mtime(&app.lib_path);
+        app.snapshot = app.lib.clone();
         if app.selected.is_none_or(|id| !app.lib.games.iter().any(|g| g.id == id)) {
             app.selected = app.sorted_ids().first().copied();
         }
@@ -306,6 +333,21 @@ impl App {
                     };
                     self.favicons.insert(host, fav);
                 }
+                Done::PageText { guide, text } => {
+                    // only if the paste window is still open for that guide
+                    if let Some((gid, buf)) = &mut self.bulk {
+                        if *gid == guide {
+                            self.bulk_fetching = false;
+                            match text {
+                                Ok(t) => {
+                                    *buf = t;
+                                    self.bulk_error = None;
+                                }
+                                Err(e) => self.bulk_error = Some(e),
+                            }
+                        }
+                    }
+                }
             }
         }
         any
@@ -332,6 +374,17 @@ impl App {
         if check {
             let h = hash_lib(&self.lib);
             if h != self.last_hash {
+                // The first change after a pause starts a new undo step (typing a note is one
+                // step, not one per letter).
+                if now - self.changed_at > 1.0 {
+                    self.undo.push(std::mem::replace(&mut self.snapshot, self.lib.clone()));
+                    if self.undo.len() > 100 {
+                        self.undo.remove(0);
+                    }
+                    self.redo.clear();
+                } else {
+                    self.snapshot = self.lib.clone();
+                }
                 self.last_hash = h;
                 self.changed_at = now;
             }
@@ -339,6 +392,22 @@ impl App {
         if self.last_hash != self.saved_hash && now - self.changed_at > 0.8 {
             self.flush();
         }
+    }
+
+    fn undo_redo(&mut self, undo: bool) {
+        let (from, to) = if undo { (&mut self.undo, &mut self.redo) } else { (&mut self.redo, &mut self.undo) };
+        let Some(state) = from.pop() else {
+            self.set_status(if undo { "Nothing to undo" } else { "Nothing to redo" });
+            return;
+        };
+        to.push(std::mem::replace(&mut self.lib, state));
+        self.snapshot = self.lib.clone();
+        self.last_hash = hash_lib(&self.lib);
+        self.changed_at = self.time();
+        if self.selected.is_some_and(|id| !self.lib.games.iter().any(|g| g.id == id)) {
+            self.selected = self.sorted_ids().first().copied();
+        }
+        self.set_status(if undo { "Undone" } else { "Redone" });
     }
 
     fn flush(&mut self) {
@@ -375,6 +444,14 @@ impl App {
                 for link in links::extract_all(&s) {
                     self.add_guide(&link);
                 }
+            }
+        }
+        if !typing {
+            let redo = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::Z) || i.consume_key(egui::Modifiers::COMMAND, Key::Y));
+            if redo {
+                self.undo_redo(false);
+            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::Z)) {
+                self.undo_redo(true);
             }
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::N)) {
@@ -421,6 +498,12 @@ impl App {
                     if self.online_on {
                         self.favicons.retain(|_, f| !matches!(f, Fav::Missing));
                     }
+                }
+                if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Redo")).on_hover_text("Ctrl+Y").clicked() {
+                    self.undo_redo(false);
+                }
+                if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Undo")).on_hover_text("Ctrl+Z").clicked() {
+                    self.undo_redo(true);
                 }
                 if ui.add(egui::Button::new("Settings").selected(self.show_settings)).clicked() {
                     self.show_settings = !self.show_settings;
@@ -545,6 +628,20 @@ impl App {
                     ui.selectable_value(&mut g.status, s, RichText::new(s.label()).color(s.color()));
                 }
             });
+            if g.has_deadlines() || !g.game_date.is_empty() {
+                ui.add_space(6.0);
+                ui.label(RichText::new("In-game date").color(TEAL));
+                let r = ui
+                    .add(egui::TextEdit::singleline(&mut g.game_date).id_salt(("date", gid)).hint_text("M/D").desired_width(56.0))
+                    .on_hover_text("Today's date in the game, as month/day (e.g. 4/2).\nItems ending within 2 weeks are highlighted; ones past their date count as missed.");
+                if r.changed() {
+                    let today = g.today();
+                    g.guides.iter_mut().for_each(|x| x.follow_checklist(today));
+                }
+                if !g.game_date.trim().is_empty() && g.today().is_none() {
+                    ui.label(RichText::new("use M/D").small().color(MAGENTA));
+                }
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 delete = armed_button(ui, ("del-game", gid), "Delete game", now);
             });
@@ -689,16 +786,21 @@ impl App {
 
     fn checklist_view(&mut self, ui: &mut Ui, gid: u64) {
         let Some(game) = self.lib.games.iter().find(|g| g.id == gid) else { return };
+        let today = game.today();
         let active = self
             .active_list
             .filter(|id| game.guides.iter().any(|g| g.id == *id))
             .or_else(|| game.guides.iter().find(|g| !g.steps.is_empty()).map(|g| g.id))
             .or_else(|| game.guides.first().map(|g| g.id));
+        if active != self.active_list {
+            self.list_section = None;
+        }
         self.active_list = active;
         let Some(aid) = active else { return };
         let choices: Vec<(u64, String, usize)> = game.guides.iter().map(|g| (g.id, g.title.clone(), g.steps.len())).collect();
+        let has_steps = choices.iter().any(|c| c.0 == aid && c.2 > 0);
 
-        // ---- toolbar: which guide, and actions
+        // ---- toolbar: which guide, view switch and actions
         let mut paste = false;
         let mut untick = false;
         let mut clear = false;
@@ -706,13 +808,14 @@ impl App {
             if choices.len() > 1 {
                 let cur = choices.iter().find(|c| c.0 == aid).map(|c| c.1.clone()).unwrap_or_default();
                 egui::ComboBox::from_id_salt(("list-guide", gid))
-                    .width(ui.available_width().min(420.0))
+                    .width((ui.available_width() - 330.0).clamp(160.0, 420.0))
                     .selected_text(RichText::new(cur).font(bold(16.0)))
                     .show_ui(ui, |ui| {
                         for (id, title, n) in &choices {
                             let label = if *n > 0 { format!("{title}  ({n})") } else { title.clone() };
                             if ui.selectable_label(*id == aid, label).clicked() {
                                 self.active_list = Some(*id);
+                                self.list_section = None;
                             }
                         }
                     });
@@ -733,15 +836,26 @@ impl App {
                 if ui.button("Paste checklist…").clicked() {
                     paste = true;
                 }
+                if has_steps {
+                    if ui.add(egui::Button::new("Full list").selected(!self.left_view)).clicked() {
+                        self.left_view = false;
+                    }
+                    if ui.add(egui::Button::new("What's left").selected(self.left_view)).on_hover_text("What's still to do, area by area").clicked() {
+                        self.left_view = true;
+                    }
+                }
             });
         });
 
-        let App { lib, list_kind, hide_done, list_search, collapsed, scroll_to_next, step_bufs, .. } = self;
+        let App { lib, list_kind, list_scope, hide_done, list_search, list_section, left_view, collapsed, scroll_to_next, step_bufs, .. } = self;
         let Some(game) = lib.game_mut(gid) else { return };
         let Some(guide) = game.guides.iter_mut().find(|g| g.id == aid) else { return };
         if untick {
-            guide.steps.iter_mut().for_each(|s| s.done = false);
-            guide.follow_checklist();
+            guide.steps.iter_mut().for_each(|s| {
+                s.done = false;
+                s.missed = false;
+            });
+            guide.follow_checklist(today);
         }
         if clear {
             guide.steps.clear();
@@ -752,10 +866,10 @@ impl App {
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new("No checklist for this guide yet").font(bold(20.0)).color(TEAL));
                 ui.add_space(6.0);
-                ui.label(RichText::new("Copy the guide's text and paste it in: chests, objectives, achievements and their How / Reward lines become ticks.").color(DIM));
+                ui.label(RichText::new("Fetch it from the guide page, or copy the guide's text and paste it in: chests, objectives, achievements, quests and their How / Reward lines become ticks.").color(DIM));
                 ui.label(RichText::new("Or add items one at a time below.").color(DIM));
                 ui.add_space(10.0);
-                if ui.button(RichText::new("Paste checklist…").font(bold(18.0))).clicked() {
+                if ui.button(RichText::new("Paste or fetch checklist…").font(bold(18.0))).clicked() {
                     paste = true;
                 }
             });
@@ -768,142 +882,266 @@ impl App {
             return;
         }
 
-        // ---- filters
-        let total = guide.steps.len();
-        let done = guide.steps.iter().filter(|s| s.done).count();
-        ui.add_space(2.0);
-        let kinds = StepKind::ALL.iter().filter(|k| guide.steps.iter().any(|s| s.kind == **k)).count();
-        if kinds < 2 {
-            *list_kind = None;
-        }
-        ui.horizontal_wrapped(|ui| {
-            if kinds > 1 && ui.selectable_label(list_kind.is_none(), format!("All {done}/{total}")).clicked() {
-                *list_kind = None;
-            }
-            for k in StepKind::ALL.into_iter().filter(|_| kinds > 1) {
-                let n = guide.steps.iter().filter(|s| s.kind == k).count();
-                if n == 0 {
-                    continue;
-                }
-                let d = guide.steps.iter().filter(|s| s.kind == k && s.done).count();
-                if ui.selectable_label(*list_kind == Some(k), format!("{} {d}/{n}", k.plural())).clicked() {
-                    *list_kind = if *list_kind == Some(k) { None } else { Some(k) };
-                }
-            }
-            ui.add_space(8.0);
-            ui.checkbox(hide_done, "Hide done");
-            ui.add_space(8.0);
-            ui.add(egui::TextEdit::singleline(list_search).hint_text("Search…").desired_width(160.0));
-            if ui.button("Go to next").on_hover_text("Scroll to the first unticked item").clicked() {
-                *scroll_to_next = true;
-                if let Some(n) = guide.next_step() {
-                    collapsed.remove(&(aid, n.section.clone()));
-                }
-            }
-        });
-
         // ---- overall progress
+        let states: Vec<StepState> = guide.steps.iter().map(|s| s.state(today)).collect();
+        let total = guide.steps.len();
+        let done = states.iter().filter(|s| **s == StepState::Done).count();
+        let missed = states.iter().filter(|s| **s == StepState::Missed).count();
+        let due = states.iter().filter(|s| **s == StepState::DueSoon).count();
+        let counted = (total - missed).max(1);
         ui.horizontal(|ui| {
-            let frac = done as f32 / total as f32;
-            let (r, _) = ui.allocate_exact_size(Vec2::new((ui.available_width() - 150.0).max(80.0), 20.0), Sense::hover());
+            let frac = done as f32 / counted as f32;
+            let (r, _) = ui.allocate_exact_size(Vec2::new((ui.available_width() - 260.0).max(80.0), 20.0), Sense::hover());
             let bar = Rect::from_center_size(r.center(), Vec2::new(r.width(), 10.0));
             rail(ui, bar, frac, false, ("list-rail", aid));
-            let col = if done == total { Color32::from_rgb(0x8C, 0xF0, 0x8C) } else { YELLOW };
-            ui.label(RichText::new(format!("{done} / {total} · {:.0}%", frac * 100.0)).font(bold(16.0)).color(col));
+            let col = if done == counted { GREEN } else { YELLOW };
+            ui.label(RichText::new(format!("{done} / {counted} · {:.0}%", frac * 100.0)).font(bold(16.0)).color(col));
+            if due > 0 {
+                ui.label(RichText::new(format!("{due} due soon")).color(MAGENTA));
+            }
+            if missed > 0 {
+                ui.label(RichText::new(format!("{missed} missed")).color(DIM));
+            }
         });
-        ui.add_space(4.0);
 
-        // ---- the list
-        let q = list_search.to_lowercase();
-        let kind_filter = *list_kind;
-        let hide = *hide_done;
-        let visible = |s: &Step| {
-            kind_filter.is_none_or(|k| s.kind == k)
-                && (!hide || !s.done)
-                && (q.is_empty() || [&s.text, &s.detail, &s.how, &s.reward, &s.section].iter().any(|t| t.to_lowercase().contains(&q)))
-        };
-        // per-area counts (respecting the type filter)
-        let mut areas: Vec<(String, usize, usize)> = Vec::new();
-        for s in guide.steps.iter().filter(|s| kind_filter.is_none_or(|k| s.kind == k)) {
-            match areas.iter_mut().find(|a| a.0 == s.section) {
-                Some(a) => {
-                    a.1 += s.done as usize;
-                    a.2 += 1;
-                }
-                None => areas.push((s.section.clone(), s.done as usize, 1)),
-            }
-        }
-        let next = guide.steps.iter().position(|s| !s.done);
-        let web = guide.kind != Kind::Video && guide.kind != Kind::Sheet;
-        let shown = guide.steps.iter().filter(|s| visible(s)).count();
-        let scroll_next = std::mem::take(scroll_to_next);
+        let next = guide.next_index(today);
         let mut acts: Vec<(usize, RowAct)> = Vec::new();
-        let mut toggle_section = None;
 
-        egui::ScrollArea::vertical().id_salt(("checklist", aid)).auto_shrink([false, false]).show(ui, |ui| {
-            if shown == 0 {
-                ui.add_space(16.0);
-                let msg = if done == total { "All done!" } else { "Nothing matches these filters" };
-                ui.vertical_centered(|ui| ui.label(RichText::new(msg).font(bold(18.0)).color(TEAL)));
-            }
-            let mut last_section: Option<String> = None;
-            for (i, s) in guide.steps.iter_mut().enumerate() {
-                if !visible(s) {
+        if *left_view {
+            // ---- What's left: area by area
+            let mut areas: Vec<(String, Vec<usize>)> = Vec::new();
+            for (i, s) in guide.steps.iter().enumerate() {
+                if !matches!(states[i], StepState::Open | StepState::DueSoon) {
                     continue;
                 }
-                if last_section.as_deref() != Some(s.section.as_str()) {
-                    last_section = Some(s.section.clone());
-                    if !s.section.is_empty() {
-                        let (d, n) = areas.iter().find(|a| a.0 == s.section).map_or((0, 0), |a| (a.1, a.2));
-                        let shut = collapsed.contains(&(aid, s.section.clone()));
-                        ui.add_space(4.0);
-                        if section_header(ui, &s.section, d, n, shut).clicked() {
-                            toggle_section = Some(s.section.clone());
-                        }
-                        ui.add_space(4.0);
+                match areas.iter_mut().find(|a| a.0 == s.section) {
+                    Some(a) => a.1.push(i),
+                    None => areas.push((s.section.clone(), vec![i])),
+                }
+            }
+            let left: usize = areas.iter().map(|a| a.1.len()).sum();
+            let mut view_area = None;
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().id_salt(("left", aid)).auto_shrink([false, false]).show(ui, |ui| {
+                if left == 0 {
+                    ui.add_space(16.0);
+                    ui.vertical_centered(|ui| ui.label(RichText::new("Nothing left. All done!").font(bold(20.0)).color(GREEN)));
+                    return;
+                }
+                ui.label(RichText::new(format!("{left} left: {}", kind_counts(&guide.steps, areas.iter().flat_map(|a| a.1.iter().copied())))).font(bold(18.0)).color(YELLOW));
+                ui.add_space(6.0);
+                for (sec, idx) in &areas {
+                    egui::Frame::new().fill(CARD_BG).stroke(Stroke::new(1.0f32, INDIGO)).corner_radius(3).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            let name = if sec.is_empty() { "Other" } else { sec.as_str() };
+                            ui.label(RichText::new(name).font(bold(18.0)).color(YELLOW));
+                            ui.label(RichText::new(kind_counts(&guide.steps, idx.iter().copied())).color(TEAL));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button("Show these").on_hover_text("Open the list at this area, finished items hidden").clicked() {
+                                    view_area = Some(sec.clone());
+                                }
+                            });
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            for &i in idx {
+                                let s = &guide.steps[i];
+                                let col = if states[i] == StepState::DueSoon { MAGENTA } else if Some(i) == next { MAGENTA } else { WHITE };
+                                let mut text = s.text.clone();
+                                if states[i] == StepState::DueSoon {
+                                    text = format!("{text} (ends {})", s.deadline);
+                                }
+                                let chip = egui::Frame::new().fill(INK).stroke(Stroke::new(1.0f32, if Some(i) == next { MAGENTA } else { INDIGO })).corner_radius(2).inner_margin(egui::Margin::symmetric(5, 1)).show(ui, |ui| {
+                                    let (ir, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+                                    icons::step_icon(ui.painter(), ir, s.kind, false);
+                                    ui.label(RichText::new(text).color(col));
+                                });
+                                let r = chip.response.interact(Sense::click()).on_hover_text("Click to tick off");
+                                if r.clicked() {
+                                    acts.push((i, RowAct::Toggle));
+                                }
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                }
+            });
+            if let Some(sec) = view_area {
+                *left_view = false;
+                *hide_done = true;
+                collapsed.remove(&(aid, sec.clone()));
+                *list_section = Some(sec);
+            }
+        } else {
+            // ---- filters
+            let kinds = StepKind::ALL.iter().filter(|k| guide.steps.iter().any(|s| s.kind == **k)).count();
+            if kinds < 2 {
+                *list_kind = None;
+            }
+            let any_optional = guide.steps.iter().any(|s| s.optional);
+            if !any_optional {
+                *list_scope = None;
+            }
+            ui.horizontal_wrapped(|ui| {
+                if kinds > 1 && ui.selectable_label(list_kind.is_none(), "All types").clicked() {
+                    *list_kind = None;
+                }
+                for k in StepKind::ALL.into_iter().filter(|_| kinds > 1) {
+                    let n = guide.steps.iter().filter(|s| s.kind == k).count();
+                    if n == 0 {
+                        continue;
+                    }
+                    let d = guide.steps.iter().filter(|s| s.kind == k && s.done).count();
+                    if ui.selectable_label(*list_kind == Some(k), format!("{} {d}/{n}", k.plural())).clicked() {
+                        *list_kind = if *list_kind == Some(k) { None } else { Some(k) };
                     }
                 }
-                if !s.section.is_empty() && collapsed.contains(&(aid, s.section.clone())) {
+                if any_optional {
+                    if kinds > 1 {
+                        ui.add_space(6.0);
+                    }
+                    for (scope, label) in [(Some(false), "Story"), (Some(true), "Optional")] {
+                        let n = guide.steps.iter().filter(|s| Some(s.optional) == scope).count();
+                        if ui.selectable_label(*list_scope == scope, format!("{label} {n}")).clicked() {
+                            *list_scope = if *list_scope == scope { None } else { scope };
+                        }
+                    }
+                }
+                ui.add_space(8.0);
+                ui.checkbox(hide_done, "Hide done");
+                ui.add(egui::TextEdit::singleline(list_search).hint_text("Search…").desired_width(140.0));
+                if ui.button("Go to next").on_hover_text("Scroll to the next thing to do").clicked() {
+                    *scroll_to_next = true;
+                    if let Some(n) = next {
+                        collapsed.remove(&(aid, guide.steps[n].section.clone()));
+                        if list_section.as_ref().is_some_and(|s| *s != guide.steps[n].section) {
+                            *list_section = None;
+                        }
+                    }
+                }
+                if let Some(sec) = list_section.clone() {
+                    if ui.button(RichText::new(format!("Area: {sec}  x")).color(TEAL)).on_hover_text("Show every area again").clicked() {
+                        *list_section = None;
+                    }
+                }
+            });
+            ui.add_space(4.0);
+
+            // ---- the list
+            let q = list_search.to_lowercase();
+            let (kind_filter, scope, hide, area_filter) = (*list_kind, *list_scope, *hide_done, list_section.clone());
+            let visible = |i: usize, s: &Step| {
+                kind_filter.is_none_or(|k| s.kind == k)
+                    && scope.is_none_or(|o| s.optional == o)
+                    && (!hide || matches!(states[i], StepState::Open | StepState::DueSoon))
+                    && area_filter.as_ref().is_none_or(|a| *a == s.section)
+                    && (q.is_empty() || [&s.text, &s.detail, &s.how, &s.reward, &s.section].iter().any(|t| t.to_lowercase().contains(&q)))
+            };
+            // per-area counts (respecting the type / story filters)
+            let mut areas: Vec<(String, usize, usize)> = Vec::new();
+            for (i, s) in guide.steps.iter().enumerate() {
+                if !kind_filter.is_none_or(|k| s.kind == k) || !scope.is_none_or(|o| s.optional == o) || states[i] == StepState::Missed {
                     continue;
                 }
-                let is_next = next == Some(i);
-                let resp = step_row(ui, s, i, is_next, web && !s.anchor.is_empty(), &mut acts);
-                if is_next && scroll_next {
-                    resp.scroll_to_me(Some(Align::Center));
+                let d = (states[i] == StepState::Done) as usize;
+                match areas.iter_mut().find(|a| a.0 == s.section) {
+                    Some(a) => {
+                        a.1 += d;
+                        a.2 += 1;
+                    }
+                    None => areas.push((s.section.clone(), d, 1)),
                 }
-                ui.add_space(4.0);
             }
-            ui.add_space(8.0);
-            add_item_row(ui, guide, step_bufs.entry(aid).or_default());
-        });
+            let web = guide.kind != Kind::Video && guide.kind != Kind::Sheet;
+            let shown = guide.steps.iter().enumerate().filter(|(i, s)| visible(*i, s)).count();
+            let scroll_next = std::mem::take(scroll_to_next);
+            let mut toggle_section = None;
 
-        if let Some(sec) = toggle_section {
-            let key = (aid, sec);
-            if !collapsed.remove(&key) {
-                collapsed.insert(key);
+            egui::ScrollArea::vertical().id_salt(("checklist", aid)).auto_shrink([false, false]).show(ui, |ui| {
+                if shown == 0 {
+                    ui.add_space(16.0);
+                    let msg = if done == counted { "All done!" } else { "Nothing matches these filters" };
+                    ui.vertical_centered(|ui| ui.label(RichText::new(msg).font(bold(18.0)).color(TEAL)));
+                }
+                let mut last_section: Option<String> = None;
+                for (i, s) in guide.steps.iter().enumerate() {
+                    if !visible(i, s) {
+                        continue;
+                    }
+                    if last_section.as_deref() != Some(s.section.as_str()) {
+                        last_section = Some(s.section.clone());
+                        if !s.section.is_empty() {
+                            let (d, n) = areas.iter().find(|a| a.0 == s.section).map_or((0, 0), |a| (a.1, a.2));
+                            let shut = collapsed.contains(&(aid, s.section.clone()));
+                            ui.add_space(4.0);
+                            if section_header(ui, &s.section, d, n, shut).clicked() {
+                                toggle_section = Some(s.section.clone());
+                            }
+                            ui.add_space(4.0);
+                        }
+                    }
+                    if !s.section.is_empty() && collapsed.contains(&(aid, s.section.clone())) {
+                        continue;
+                    }
+                    let is_next = next == Some(i);
+                    let resp = step_row(ui, s, i, states[i], is_next, web && !s.anchor.is_empty(), &mut acts);
+                    if is_next && scroll_next {
+                        resp.scroll_to_me(Some(Align::Center));
+                    }
+                    ui.add_space(4.0);
+                }
+                ui.add_space(8.0);
+                add_item_row(ui, guide, step_bufs.entry(aid).or_default());
+            });
+            if let Some(sec) = toggle_section {
+                let key = (aid, sec);
+                if !collapsed.remove(&key) {
+                    collapsed.insert(key);
+                }
             }
         }
+
         let mut find = None;
         let mut progressed = false;
         for (i, a) in acts {
+            if i >= guide.steps.len() {
+                continue;
+            }
             match a {
                 RowAct::Toggle => {
-                    if let Some(s) = guide.steps.get_mut(i) {
-                        s.done = !s.done;
-                        progressed = true;
+                    let s = &mut guide.steps[i];
+                    s.done = !s.done;
+                    if s.done {
+                        s.missed = false;
                     }
+                    progressed = true;
                 }
-                RowAct::Find => find = guide.steps.get(i).map(|s| links::with_text(&guide.url, &s.anchor)),
-                RowAct::Delete if i < guide.steps.len() => {
+                RowAct::Missed => {
+                    let s = &mut guide.steps[i];
+                    // an expired item can be un-missed only by ticking it; this toggles the manual flag
+                    s.missed = !s.missed;
+                    if s.missed {
+                        s.done = false;
+                    }
+                    progressed = true;
+                }
+                RowAct::Optional => guide.steps[i].optional = !guide.steps[i].optional,
+                RowAct::Find => {
+                    let s = &guide.steps[i];
+                    let page = if s.url.is_empty() { &guide.url } else { &s.url };
+                    find = Some(links::with_text(page, &s.anchor));
+                }
+                RowAct::Delete => {
                     guide.steps.remove(i);
                 }
-                RowAct::Up if i > 0 && i < guide.steps.len() => guide.steps.swap(i, i - 1),
+                RowAct::Up if i > 0 => guide.steps.swap(i, i - 1),
                 RowAct::Down if i + 1 < guide.steps.len() => guide.steps.swap(i, i + 1),
                 _ => {}
             }
         }
         if progressed {
-            guide.follow_checklist();
+            guide.follow_checklist(today);
         }
         if find.is_some() {
             guide.last_opened = Some(model::now());
@@ -1140,42 +1378,88 @@ impl App {
     }
 
     fn bulk_window(&mut self, ctx: &egui::Context) {
-        let Some((guide_id, text)) = &mut self.bulk else { return };
-        let existing = self.lib.games.iter().flat_map(|g| &g.guides).find(|g| g.id == *guide_id).map_or(0, |g| g.steps.len());
+        let Some((guide_id, _)) = &self.bulk else { return };
+        let guide_id = *guide_id;
+        let (url, existing, web) = self
+            .lib
+            .games
+            .iter()
+            .flat_map(|g| &g.guides)
+            .find(|g| g.id == guide_id)
+            .map_or((String::new(), 0, false), |g| (g.url.clone(), g.steps.len(), g.kind != Kind::Video && g.kind != Kind::Sheet));
+
+        // parse once per change of text/mode, not every frame (fetched pages can be big)
+        let key = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            self.bulk.as_ref().map(|b| &b.1).hash(&mut h);
+            self.bulk_headings.hash(&mut h);
+            h.finish()
+        };
+        if self.bulk_cache.as_ref().is_none_or(|c| c.0 != key) {
+            let text = &self.bulk.as_ref().unwrap().1;
+            let parsed = if self.bulk_headings { checklist::parse_headings(text) } else { checklist::parse(text) };
+            self.bulk_cache = Some((key, parsed));
+        }
+        let has_headings = self.bulk.as_ref().is_some_and(|b| b.1.lines().any(|l| l.starts_with("## ")));
+
         let mut open = true;
         let mut apply = false;
-        let parsed = checklist::parse(text);
-        egui::Window::new(RichText::new("Paste checklist").font(bold(18.0)))
+        let mut fetch = false;
+        let parsed = &self.bulk_cache.as_ref().unwrap().1;
+        let n = parsed.len();
+        egui::Window::new(RichText::new("Paste or fetch checklist").font(bold(18.0)))
             .open(&mut open)
             .collapsible(false)
-            .default_width(560.0)
+            .default_width(600.0)
             .pivot(Align2::CENTER_CENTER)
             .default_pos(ctx.screen_rect().center())
             .show(ctx, |ui| {
-                ui.label(RichText::new("Paste the guide's text. Area headings, chests, objectives and achievements (with their How: and Reward: lines) are picked up automatically. A plain list works too: one item per line.").small().color(DIM));
+                ui.horizontal(|ui| {
+                    let label = if self.bulk_fetching { "Fetching…" } else { "Fetch from guide page" };
+                    if ui
+                        .add_enabled(web && !self.bulk_fetching && !url.is_empty(), egui::Button::new(RichText::new(label).font(bold(16.0))))
+                        .on_hover_text(format!("Download the guide's text from\n{url}"))
+                        .clicked()
+                    {
+                        fetch = true;
+                    }
+                    ui.label(RichText::new("or paste the guide's text below").color(DIM));
+                });
+                if let Some(err) = &self.bulk_error {
+                    ui.label(RichText::new(err).color(MAGENTA));
+                }
+                ui.label(
+                    RichText::new("Area headings, chests, objectives, achievements and quests (with their How:, Reward: and End: lines) are picked up automatically. A plain list works too: one item per line.")
+                        .small()
+                        .color(DIM),
+                );
                 ui.add_space(4.0);
-                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                let text = &mut self.bulk.as_mut().unwrap().1;
+                egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
                     ui.add(
                         egui::TextEdit::multiline(text)
-                            .desired_rows(16)
+                            .desired_rows(15)
                             .desired_width(f32::INFINITY)
-                            .hint_text("Castle Town (1st Playthrough)
-Chest 1 - Potion; on the road to ...
-Objective 14: Frozen Rail Ride
-\"Use ice-based magic to ...\"
-How: ...
-Reward: ..."),
+                            .hint_text("Castle Town (1st Playthrough)\nChest 1 - Potion; on the road to ...\nObjective 14: Frozen Rail Ride\n\"Use ice-based magic to ...\"\nHow: ...\nReward: ..."),
                     );
                 });
                 ui.add_space(4.0);
+                if has_headings || self.bulk_headings {
+                    ui.checkbox(&mut self.bulk_headings, "Use only the page's headings as items")
+                        .on_hover_text("For long walkthroughs written as prose: one item per chapter / section heading.");
+                }
                 // preview of what was understood
                 let mut counts: Vec<String> = StepKind::ALL
                     .iter()
                     .filter_map(|k| {
-                        let n = parsed.iter().filter(|s| s.kind == *k).count();
-                        (n > 0).then(|| format!("{n} {}", k.plural().to_lowercase()))
+                        let c = parsed.iter().filter(|s| s.kind == *k).count();
+                        (c > 0).then(|| format!("{c} {}", k.plural().to_lowercase()))
                     })
                     .collect();
+                let optional = parsed.iter().filter(|s| s.optional).count();
+                if optional > 0 {
+                    counts.push(format!("{optional} optional with deadlines"));
+                }
                 let mut sections: Vec<&str> = parsed.iter().map(|s| s.section.as_str()).filter(|s| !s.is_empty()).collect();
                 sections.dedup();
                 if !sections.is_empty() {
@@ -1183,36 +1467,52 @@ Reward: ..."),
                 }
                 let summary = if parsed.is_empty() { "Nothing found yet".to_string() } else { format!("Found {}", counts.join(", ")) };
                 ui.label(RichText::new(summary).color(TEAL));
+                if n > 300 || (n > 150 && has_headings && !self.bulk_headings) {
+                    ui.label(RichText::new("That's a lot of items. If it's picking up every paragraph, try \"Use only the page's headings\", or trim the text first.").small().color(MAGENTA));
+                }
                 if existing > 0 {
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut self.bulk_replace, false, "Add to the end");
                         ui.radio_value(&mut self.bulk_replace, true, format!("Replace the current checklist ({existing} items)"));
                     });
                 }
-                if ui.add_enabled(!parsed.is_empty(), egui::Button::new(RichText::new(format!("Add {} items", parsed.len())).font(bold(16.0)))).clicked() {
+                if ui.add_enabled(n > 0, egui::Button::new(RichText::new(format!("Add {n} items")).font(bold(16.0)))).clicked() {
                     apply = true;
                 }
             });
+        if fetch {
+            self.bulk_fetching = true;
+            self.bulk_error = None;
+            self.online.send(Job::PageText { guide: guide_id, url });
+        }
         if apply {
-            let gid = *guide_id;
-            let n = parsed.len();
+            let parsed = self.bulk_cache.take().map(|c| c.1).unwrap_or_default();
             let replace = self.bulk_replace;
             for game in &mut self.lib.games {
-                if let Some(g) = game.guides.iter_mut().find(|g| g.id == gid) {
+                let today = game.today();
+                if let Some(g) = game.guides.iter_mut().find(|g| g.id == guide_id) {
                     if replace {
                         g.steps.clear();
                     }
                     g.steps.extend(parsed);
-                    g.follow_checklist();
+                    g.follow_checklist(today);
                     break;
                 }
             }
-            self.active_list = Some(gid);
-            self.bulk = None;
+            self.active_list = Some(guide_id);
+            self.close_bulk();
             self.set_status(format!("Added {n} items"));
         } else if !open {
-            self.bulk = None;
+            self.close_bulk();
         }
+    }
+
+    fn close_bulk(&mut self) {
+        self.bulk = None;
+        self.bulk_cache = None;
+        self.bulk_error = None;
+        self.bulk_fetching = false;
+        self.bulk_headings = false;
     }
 
     fn settings_window(&mut self, ctx: &egui::Context) {
@@ -1480,11 +1780,13 @@ struct CardCtx<'a> {
 fn guide_card(ui: &mut Ui, g: &mut Guide, c: &mut CardCtx) -> Vec<CardAct> {
     let mut acts = Vec::new();
     let border = if c.last_used { MAGENTA } else { INDIGO };
+    // Reference links (no checklist, nothing to fill in) take one line until expanded.
+    let compact = g.steps.is_empty() && !matches!(g.kind, Kind::Video | Kind::Sheet) && !c.expanded;
     let resp = egui::Frame::new()
         .fill(CARD_BG)
         .stroke(Stroke::new(1.0f32, border))
         .corner_radius(2)
-        .inner_margin(6)
+        .inner_margin(if compact { egui::Margin::symmetric(6, 3) } else { egui::Margin::same(6) })
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             // ---- title row
@@ -1560,6 +1862,9 @@ fn guide_card(ui: &mut Ui, g: &mut Guide, c: &mut CardCtx) -> Vec<CardAct> {
                 });
             });
 
+            if compact {
+                return;
+            }
             // ---- info row
             ui.horizontal(|ui| {
                 ui.add_space(42.0);
@@ -1768,29 +2073,61 @@ fn big_checkbox(ui: &mut Ui, checked: bool) -> egui::Response {
     resp
 }
 
+/// "2 chests · 1 objective" for the given items.
+fn kind_counts(steps: &[Step], idx: impl Iterator<Item = usize>) -> String {
+    let mut n = [0usize; 4];
+    for i in idx {
+        n[StepKind::ALL.iter().position(|k| *k == steps[i].kind).unwrap_or(3)] += 1;
+    }
+    let names = [("chest", "chests"), ("objective", "objectives"), ("achievement", "achievements"), ("item", "items")];
+    StepKind::ALL
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| n[*i] > 0)
+        .map(|(i, _)| format!("{} {}", n[i], if n[i] == 1 { names[i].0 } else { names[i].1 }))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// A small outlined tag, e.g. "optional" or "Ends 9/25".
+fn tag(ui: &mut Ui, text: &str, col: Color32) {
+    egui::Frame::new().fill(INK).stroke(Stroke::new(1.0f32, col)).corner_radius(2).inner_margin(egui::Margin::symmetric(5, 1)).show(ui, |ui| {
+        ui.label(RichText::new(text).small().color(col));
+    });
+}
+
 /// One checklist item: tick box, type icon, name, requirement, How and Reward.
 /// Clicking anywhere on the row ticks it.
-fn step_row(ui: &mut Ui, s: &Step, i: usize, is_next: bool, can_find: bool, acts: &mut Vec<(usize, RowAct)>) -> egui::Response {
+fn step_row(ui: &mut Ui, s: &Step, i: usize, state: StepState, is_next: bool, can_find: bool, acts: &mut Vec<(usize, RowAct)>) -> egui::Response {
+    let done = state == StepState::Done;
+    let missed = state == StepState::Missed;
+    let faded = done || missed;
     let resp = ui
         .scope_builder(egui::UiBuilder::new().id_salt(("step-row", i)).sense(Sense::click()), |ui| {
             let hovered = ui.response().hovered();
             let fill = if hovered {
                 HOVER_BG
-            } else if s.done {
+            } else if faded {
                 Color32::from_rgb(0x1c, 0x1b, 0x2c)
             } else {
                 CARD_BG
             };
-            let stroke = if is_next { Stroke::new(2.0f32, MAGENTA) } else { Stroke::new(1.0f32, if s.done { Color32::from_rgb(0x2a, 0x26, 0x48) } else { INDIGO }) };
+            let stroke = if is_next {
+                Stroke::new(2.0f32, MAGENTA)
+            } else if state == StepState::DueSoon {
+                Stroke::new(1.5f32, MAGENTA.gamma_multiply(0.6))
+            } else {
+                Stroke::new(1.0f32, if faded { Color32::from_rgb(0x2a, 0x26, 0x48) } else { INDIGO })
+            };
             egui::Frame::new().fill(fill).stroke(stroke).corner_radius(3).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.horizontal_top(|ui| {
-                    if big_checkbox(ui, s.done).on_hover_text(if s.done { "Untick" } else { "Tick off" }).clicked() {
+                    if big_checkbox(ui, done).on_hover_text(if done { "Untick" } else { "Tick off" }).clicked() {
                         acts.push((i, RowAct::Toggle));
                     }
                     ui.add_space(4.0);
                     let (ir, _) = ui.allocate_exact_size(Vec2::new(22.0, 24.0), Sense::hover());
-                    icons::step_icon(ui.painter(), Rect::from_center_size(ir.center(), Vec2::splat(20.0)), s.kind, s.done);
+                    icons::step_icon(ui.painter(), Rect::from_center_size(ir.center(), Vec2::splat(20.0)), s.kind, faded);
                     ui.add_space(4.0);
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
@@ -1799,22 +2136,30 @@ fn step_row(ui: &mut Ui, s: &Step, i: usize, is_next: bool, can_find: bool, acts
                                     acts.push((i, RowAct::Find));
                                 }
                                 if !s.reward.is_empty() {
-                                    egui::Frame::new().fill(INK).stroke(Stroke::new(1.0f32, if s.done { DIM } else { TEAL })).corner_radius(2).inner_margin(egui::Margin::symmetric(5, 1)).show(ui, |ui| {
-                                        ui.label(RichText::new(format!("Reward: {}", s.reward)).small().color(if s.done { DIM } else { TEAL }));
-                                    });
+                                    tag(ui, &format!("Reward: {}", s.reward), if faded { DIM } else { TEAL });
+                                }
+                                match state {
+                                    StepState::Missed => tag(ui, "Missed", Color32::from_rgb(0xE0, 0x60, 0x60)),
+                                    StepState::DueSoon => tag(ui, &format!("Ends {}", s.deadline), MAGENTA),
+                                    StepState::Open if !s.deadline.is_empty() => tag(ui, &format!("Ends {}", s.deadline), DIM),
+                                    _ => {}
+                                }
+                                if s.optional {
+                                    tag(ui, "optional", DIM);
                                 }
                                 if is_next {
                                     ui.label(RichText::new("NEXT").font(bold(14.0)).color(MAGENTA));
                                 }
                                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                    let mut t = RichText::new(&s.text).font(bold(18.0)).color(if s.done {
+                                    let col = if faded {
                                         DIM
                                     } else if is_next {
                                         MAGENTA
                                     } else {
                                         WHITE
-                                    });
-                                    if s.done {
+                                    };
+                                    let mut t = RichText::new(&s.text).font(bold(18.0)).color(col);
+                                    if done {
                                         t = t.strikethrough();
                                     }
                                     ui.add(egui::Label::new(t).wrap().selectable(false));
@@ -1824,15 +2169,14 @@ fn step_row(ui: &mut Ui, s: &Step, i: usize, is_next: bool, can_find: bool, acts
                                 });
                             });
                         });
-                        // Ticked items keep their full height (just dimmed) so nothing below
+                        // Finished items keep their full height (just dimmed) so nothing below
                         // them slides up under the mouse. "Hide done" removes them instead.
                         if !s.detail.is_empty() {
-                            let col = if s.done { DIM } else { YELLOW };
-                            ui.add(egui::Label::new(RichText::new(&s.detail).color(col)).wrap().selectable(false));
+                            ui.add(egui::Label::new(RichText::new(&s.detail).color(if faded { DIM } else { YELLOW })).wrap().selectable(false));
                         }
                         if !s.how.is_empty() {
                             ui.add_space(2.0);
-                            let col = if s.done { DIM.gamma_multiply(0.7) } else { DIM };
+                            let col = if faded { DIM.gamma_multiply(0.7) } else { DIM };
                             ui.add(egui::Label::new(RichText::new(format!("How: {}", s.how)).color(col)).wrap().selectable(false));
                         }
                     });
@@ -1847,10 +2191,22 @@ fn step_row(ui: &mut Ui, s: &Step, i: usize, is_next: bool, can_find: bool, acts
         acts.push((i, RowAct::Toggle));
     }
     resp.context_menu(|ui| {
-        if ui.button(if s.done { "Untick" } else { "Tick off" }).clicked() {
+        if ui.button(if done { "Untick" } else { "Tick off" }).clicked() {
             acts.push((i, RowAct::Toggle));
             ui.close_menu();
         }
+        let missed_label = if s.missed { "Not missed after all" } else { "Mark as missed / skipped" };
+        if !s.missed && missed && !s.deadline.is_empty() {
+            ui.label(RichText::new(format!("Past its deadline ({})", s.deadline)).small().color(DIM));
+        } else if ui.button(missed_label).clicked() {
+            acts.push((i, RowAct::Missed));
+            ui.close_menu();
+        }
+        if ui.button(if s.optional { "Mark as story" } else { "Mark as optional" }).clicked() {
+            acts.push((i, RowAct::Optional));
+            ui.close_menu();
+        }
+        ui.separator();
         if ui.button("Move up").clicked() {
             acts.push((i, RowAct::Up));
             ui.close_menu();

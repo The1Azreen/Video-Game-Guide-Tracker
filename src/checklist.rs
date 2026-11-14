@@ -61,6 +61,8 @@ fn looks_structured(text: &str) -> bool {
             || t.starts_with('\u{1F3C6}')
             || t.starts_with("How:")
             || t.starts_with("Reward:")
+            || t.starts_with("End:")
+            || t.starts_with("Objective:")
             || chest_number(t).is_some()
             || t.starts_with("Objective ") && t[10..].starts_with(|c: char| c.is_ascii_digit())
     })
@@ -96,9 +98,47 @@ fn is_heading(line: &str) -> bool {
     all_caps || in_parens || no_sentence
 }
 
+/// Lines that describe the item above them (quest-style guides).
+const FIELDS: [&str; 8] = ["From:", "Available:", "Objective:", "Location:", "End:", "Deadline:", "Ends:", "Start:"];
+
+fn is_field(line: &str) -> bool {
+    FIELDS.iter().any(|f| line.starts_with(f))
+}
+
+/// The first "M/D" date in `s`, e.g. "9/25" from "End: 9/25 (Sunday)".
+fn first_date(s: &str) -> Option<String> {
+    s.split(|c: char| !(c.is_ascii_digit() || c == '/'))
+        .find(|w| crate::model::parse_md(w).is_some())
+        .map(str::to_string)
+}
+
+/// A checklist made only of the page's headings (`## Heading` lines), for long prose guides
+/// where every paragraph would otherwise become an item.
+pub fn parse_headings(text: &str) -> Vec<Step> {
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix("## "))
+        .map(display)
+        .filter(|t| !t.is_empty())
+        .map(|t| Step { anchor: t.clone(), ..Step::task(t) })
+        .collect()
+}
+
 pub fn parse(text: &str) -> Vec<Step> {
     if !looks_structured(text) {
-        return text.lines().map(plain_item).filter(|s| !s.is_empty()).map(Step::task).collect();
+        // plain list; "## " lines (from a fetched page) become areas
+        let mut section = String::new();
+        let mut out = Vec::new();
+        for l in text.lines() {
+            if let Some(h) = l.trim().strip_prefix("## ") {
+                section = heading(h);
+                continue;
+            }
+            let t = plain_item(l);
+            if !t.is_empty() {
+                out.push(Step { section: section.clone(), ..Step::task(t) });
+            }
+        }
+        return out;
     }
     let mut out: Vec<Step> = Vec::new();
     let mut section = String::new();
@@ -106,8 +146,11 @@ pub fn parse(text: &str) -> Vec<Step> {
     let mut parent = String::new();
     // Whether the last item can still take detail lines.
     let mut open = false;
-    for raw in text.lines() {
-        let line = raw.trim();
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    for (li, raw) in lines.iter().enumerate() {
+        let explicit_heading = raw.strip_prefix("## ");
+        let line = explicit_heading.unwrap_or(raw).trim();
+        let next_is_field = lines.get(li + 1).is_some_and(|n| is_field(n));
         if line.is_empty() {
             continue;
         }
@@ -123,7 +166,38 @@ pub fn parse(text: &str) -> Vec<Step> {
             }
         };
 
-        if let Some(rest) = bare.strip_prefix("How:") {
+        if let Some(h) = explicit_heading {
+            section = heading(h);
+            parent = section.clone();
+            open = false;
+        } else if let Some((field, rest)) = FIELDS.iter().find_map(|f| bare.strip_prefix(f).map(|r| (*f, r.trim()))) {
+            if let Some(cur) = out.last_mut().filter(|_| open) {
+                match field {
+                    "Objective:" => cur.detail = format!("Objective: {}", display(rest)),
+                    "End:" | "Deadline:" | "Ends:" => {
+                        if let Some(d) = first_date(rest) {
+                            cur.deadline = d;
+                            cur.optional = true;
+                        }
+                    }
+                    _ => {
+                        if !cur.how.is_empty() {
+                            cur.how.push(' ');
+                        }
+                        cur.how.push_str(&format!("{field} {}", display(rest)));
+                    }
+                }
+            }
+        } else if next_is_field && !is_field(line) && !line.starts_with("- ") && !["Reward:", "How:", "Note:"].iter().any(|p| bare.starts_with(p)) {
+            // "Hidden Memories" followed by "From: ..." is a quest, not a heading
+            let name = display(line);
+            out.push(Step { anchor: name.clone(), section: section.clone(), ..Step::task(name) });
+            open = true;
+        } else if let Some((tag, name)) = bracket_marker(&bare) {
+            // "[Combat] - Battle vs. Bandits"
+            out.push(Step { anchor: name.clone(), section: section.clone(), ..Step::task(format!("{tag}: {name}")) });
+            open = true;
+        } else if let Some(rest) = bare.strip_prefix("How:") {
             if open {
                 push_how(&mut out, rest.trim());
             }
@@ -202,15 +276,28 @@ pub fn parse(text: &str) -> Vec<Step> {
         } else if open {
             // a stray paragraph (links, extra notes) belongs to the item above
             push_how(&mut out, line);
-        } else {
-            let t = plain_item(line);
-            if !t.is_empty() {
-                out.push(Step { section: section.clone(), ..Step::task(t) });
-                open = true;
-            }
+        } else if looks_like_list_item(line) {
+            // short list-style lines between items ("Find the key"), but not prose
+            out.push(Step { section: section.clone(), ..Step::task(plain_item(line)) });
+            open = true;
         }
     }
     out
+}
+
+/// "[Combat] - Battle vs. Bandits" → ("Combat", "Battle vs. Bandits")
+fn bracket_marker(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix('[')?;
+    let (tag, name) = rest.split_once(']')?;
+    let name = name.trim().trim_start_matches(['-', ':']).trim();
+    let ok = !tag.is_empty() && tag.len() <= 24 && tag.chars().all(|c| c.is_alphanumeric() || c == ' ') && !name.is_empty();
+    ok.then(|| (display(tag), display(name)))
+}
+
+/// Short, not a sentence, not a "Label: value" line.
+fn looks_like_list_item(line: &str) -> bool {
+    let t = plain_item(line);
+    !t.is_empty() && t.len() <= 60 && !t.ends_with(['.', '!', '?', ':', ',']) && !t.contains(": ")
 }
 
 /// "1. Chapter One" / "- [ ] Chapter One" / "• Chapter One" → "Chapter One"
@@ -290,6 +377,28 @@ Reward: Cheshire Cat.
 
         assert_eq!(s[6].section, "Additional Playthroughs \u{b7} Castle Town Objectives");
         assert_eq!(s[6].detail, "Defeat the Demon Tower with Spellweaver's Finish command.");
+    }
+
+    #[test]
+    fn quests_and_fetched_headings() {
+        let text = "## Free Time 3\n## Kindness Quests\nHidden Memories\nFrom: Old Man in Lowtown\nObjective: Deliver Jurah Carving\nLocation: Collapsed Fort\nReward: 2000G, 100R\nEnd: 7/9\nA Peculiar Message\nFrom: Citizen in City Streets\nReward: 2000G, 180R\nEnd: 5/20";
+        let s = parse(text);
+        assert_eq!(s.len(), 2, "{:#?}", s);
+        assert_eq!(s[0].text, "Hidden Memories");
+        assert_eq!(s[0].section, "Kindness Quests");
+        assert_eq!(s[0].detail, "Objective: Deliver Jurah Carving");
+        assert_eq!(s[0].how, "From: Old Man in Lowtown Location: Collapsed Fort");
+        assert_eq!(s[0].reward, "2000G, 100R");
+        assert_eq!(s[0].deadline, "7/9");
+        assert!(s[0].optional);
+        assert_eq!(s[1].deadline, "5/20");
+
+        let h = parse_headings("## Chapter 1 - Start\nsome prose\n## Chapter 2 - Road");
+        assert_eq!(h.iter().map(|x| x.text.as_str()).collect::<Vec<_>>(), ["Chapter 1 - Start", "Chapter 2 - Road"]);
+        let fe = parse("## Free Time 1\nStart: 2/20\nEnd: 2/28\n## Kindness Quests\nLost Hair Clip\nFrom: Girl\nEnd: 2/28\nAfter the cutscenes, you'll explore the town and talk to everyone you can find there.\n[Combat] - Battle vs. Bandits\n- Victory: Seize the red jewel.");
+        assert_eq!(fe.iter().map(|x| x.text.as_str()).collect::<Vec<_>>(), ["Lost Hair Clip", "Combat: Battle vs. Bandits"]);
+        let plain = parse("## Act 1\n- Find the key\n- Open the door");
+        assert_eq!(plain[1].section, "Act 1");
     }
 
     #[test]

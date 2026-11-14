@@ -126,11 +126,62 @@ pub struct Step {
     pub hidden: bool,
     /// Text on the guide's page to scroll to for this item.
     pub anchor: String,
+    /// Side content (quests, paralogues...). "Next" follows the non-optional items.
+    pub optional: bool,
+    /// Last in-game date it can be done, as "M/D" (e.g. "9/25"). Empty = no deadline.
+    pub deadline: String,
+    /// Marked as missed / skipped by hand.
+    pub missed: bool,
+    /// The page this item is on, when a guide spans several pages (one per chapter / week).
+    /// Empty = the guide's own link.
+    pub url: String,
+}
+
+/// "9/25" → (9, 25). In-game calendars (Fire Emblem, Persona...) are month/day.
+pub fn parse_md(s: &str) -> Option<(u32, u32)> {
+    let (m, d) = s.trim().split_once('/')?;
+    let (m, d) = (m.trim().parse().ok()?, d.trim().parse().ok()?);
+    ((1..=12).contains(&m) && (1..=31).contains(&d)).then_some((m, d))
+}
+
+/// Whole days from `a` to `b` on a 31-day-month calendar (close enough for "due soon").
+fn days_between(a: (u32, u32), b: (u32, u32)) -> i64 {
+    (b.0 as i64 * 31 + b.1 as i64) - (a.0 as i64 * 31 + a.1 as i64)
+}
+
+/// Where an item stands, given the game's current in-game date.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StepState {
+    Open,
+    /// Deadline within two weeks of the in-game date.
+    DueSoon,
+    Done,
+    /// Marked missed, or its deadline has passed.
+    Missed,
 }
 
 impl Step {
     pub fn task(text: impl Into<String>) -> Self {
         Step { text: text.into(), ..Default::default() }
+    }
+
+    pub fn state(&self, today: Option<(u32, u32)>) -> StepState {
+        if self.done {
+            return StepState::Done;
+        }
+        if self.missed {
+            return StepState::Missed;
+        }
+        match (today, parse_md(&self.deadline)) {
+            (Some(t), Some(d)) if days_between(t, d) < 0 => StepState::Missed,
+            (Some(t), Some(d)) if days_between(t, d) <= 14 => StepState::DueSoon,
+            _ => StepState::Open,
+        }
+    }
+
+    /// Still to do (not done, not missed).
+    pub fn is_open(&self, today: Option<(u32, u32)>) -> bool {
+        matches!(self.state(today), StepState::Open | StepState::DueSoon)
     }
 }
 
@@ -158,6 +209,8 @@ pub struct Guide {
     pub last_opened: Option<i64>,
     /// True until a real title has been fetched or typed.
     pub auto_title: bool,
+    /// For multi-page guides: the page Resume opens (the one the next item is on).
+    pub resume_page: String,
 }
 
 impl Guide {
@@ -186,7 +239,9 @@ impl Guide {
         if self.done {
             1.0
         } else if !self.steps.is_empty() {
-            self.steps.iter().filter(|s| s.done).count() as f32 / self.steps.len() as f32
+            // missed items no longer count against you
+            let counted = self.steps.iter().filter(|s| !s.missed).count().max(1);
+            self.steps.iter().filter(|s| s.done).count() as f32 / counted as f32
         } else {
             self.percent.clamp(0.0, 1.0)
         }
@@ -211,18 +266,29 @@ impl Guide {
     }
 
     pub fn next_step(&self) -> Option<&Step> {
-        self.steps.iter().find(|s| !s.done)
+        self.next_index(None).map(|i| &self.steps[i])
     }
 
-    /// After ticking things off, point Resume at the next unticked item.
-    pub fn follow_checklist(&mut self) {
+    /// The item "Next" points at: the first open story item, or, when only optional ones are
+    /// left, the first open optional item.
+    pub fn next_index(&self, today: Option<(u32, u32)>) -> Option<usize> {
+        let open = |s: &Step| s.is_open(today);
+        self.steps
+            .iter()
+            .position(|s| open(s) && !s.optional)
+            .or_else(|| self.steps.iter().position(|s| open(s)))
+    }
+
+    /// After ticking things off, point Resume at the next item.
+    pub fn follow_checklist(&mut self, today: Option<(u32, u32)>) {
         if self.kind == Kind::Video || self.kind == Kind::Sheet {
             return;
         }
-        let (anchor, section) = match self.next_step() {
-            Some(n) => (n.anchor.clone(), n.section.clone()),
+        let (anchor, section, page) = match self.next_index(today).map(|i| &self.steps[i]) {
+            Some(n) => (n.anchor.clone(), n.section.clone(), n.url.clone()),
             None => return,
         };
+        self.resume_page = page;
         if !anchor.is_empty() {
             self.jump_text = anchor;
         }
@@ -258,17 +324,29 @@ pub struct Game {
     pub last_played: Option<i64>,
     /// The guide "Continue" reopens.
     pub last_guide: Option<u64>,
+    /// Current in-game date as "M/D", for games with a calendar and missable deadlines.
+    pub game_date: String,
 }
 
 impl Game {
+    pub fn today(&self) -> Option<(u32, u32)> {
+        parse_md(&self.game_date)
+    }
+
+    pub fn has_deadlines(&self) -> bool {
+        self.guides.iter().flat_map(|g| &g.steps).any(|s| !s.deadline.is_empty())
+    }
+
     pub fn progress(&self) -> f32 {
         if self.status == Status::Completed {
             return 1.0;
         }
-        if self.guides.is_empty() {
+        // Only guides you track progress in count; plain reference links don't drag it down.
+        let tracked: Vec<&Guide> = self.guides.iter().filter(|g| !g.steps.is_empty() || g.done || g.percent > 0.0).collect();
+        if tracked.is_empty() {
             return 0.0;
         }
-        self.guides.iter().map(Guide::progress).sum::<f32>() / self.guides.len() as f32
+        tracked.iter().map(|g| g.progress()).sum::<f32>() / tracked.len() as f32
     }
 
     pub fn continue_guide(&self) -> Option<&Guide> {
@@ -446,5 +524,35 @@ pub fn date_time(ts: i64) -> String {
     match chrono::Local.timestamp_opt(ts, 0).single() {
         Some(t) => t.format("%a %d %b %Y, %H:%M").to_string(),
         None => "?".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn st(text: &str, optional: bool, deadline: &str) -> Step {
+        Step { text: text.into(), optional, deadline: deadline.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn deadlines_and_next() {
+        assert_eq!(parse_md("9/25"), Some((9, 25)));
+        assert_eq!(parse_md("13/1"), None);
+        let g = Guide {
+            steps: vec![st("old quest", true, "2/28"), st("battle", false, ""), st("soon quest", true, "4/10"), st("later quest", true, "9/1")],
+            ..Default::default()
+        };
+        let today = Some((4, 2));
+        assert_eq!(g.steps[0].state(today), StepState::Missed);
+        assert_eq!(g.steps[2].state(today), StepState::DueSoon);
+        assert_eq!(g.steps[3].state(today), StepState::Open);
+        assert_eq!(g.steps[0].state(None), StepState::Open);
+        // story first, even though optional items come earlier in the list
+        assert_eq!(g.next_index(today), Some(1));
+        let mut g2 = g.clone();
+        g2.steps[1].done = true;
+        // then the first optional item that can still be done
+        assert_eq!(g2.next_index(today), Some(2));
     }
 }
