@@ -39,6 +39,8 @@ struct Saved {
     closed_folders: Vec<String>,
     /// The explorer window's view: large icons or details.
     ex_layout: ExplorerLayout,
+    /// One-line checklist items.
+    compact_rows: bool,
     /// Reopen the explorer where it was left.
     explorer_open: bool,
     ex_path: Vec<String>,
@@ -48,7 +50,7 @@ struct Saved {
 
 impl Default for Saved {
     fn default() -> Self {
-        Saved { filter: None, selected: None, online: true, glow: true, animate: true, folder_view: true, closed_folders: Vec::new(), ex_layout: ExplorerLayout::Icons, explorer_open: false, ex_path: Vec::new(), window_size: None, maximized: false }
+        Saved { filter: None, selected: None, online: true, glow: true, animate: true, folder_view: true, closed_folders: Vec::new(), ex_layout: ExplorerLayout::Icons, compact_rows: false, explorer_open: false, ex_path: Vec::new(), window_size: None, maximized: false }
     }
 }
 
@@ -80,6 +82,8 @@ enum CardAct {
 /// What a checklist row asks for.
 enum RowAct {
     Toggle,
+    /// Open or close a compact row's details.
+    Details,
     Missed,
     Optional,
     Find,
@@ -104,6 +108,11 @@ pub struct App {
     folder_view: bool,
     closed_folders: Vec<String>,
     ex_layout: ExplorerLayout,
+    compact_rows: bool,
+    /// Focus mode: the checklist gets the whole window (Game, Guides and the journal step aside).
+    focus: bool,
+    /// Compact rows whose details are opened, by (guide, item).
+    open_rows: HashSet<(u64, usize)>,
     /// The explorer window is showing (instead of the selected game).
     explorer_open: bool,
     /// Where the explorer is: [] = top, ["Console"], ["Console", "PS5"].
@@ -201,6 +210,9 @@ impl App {
             folder_view: saved.folder_view,
             closed_folders: saved.closed_folders,
             ex_layout: saved.ex_layout,
+            compact_rows: saved.compact_rows,
+            focus: false,
+            open_rows: HashSet::new(),
             explorer_open: saved.explorer_open,
             ex_path: saved.ex_path,
             ex_back: Vec::new(),
@@ -538,6 +550,9 @@ impl App {
             } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::Z)) {
                 self.undo_redo(true);
             }
+        }
+        if self.focus && !typing && self.add_game.is_none() && self.bulk.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+            self.focus = false;
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::N)) {
             self.add_game = Some(NewGame { title: String::new(), platform: String::new(), status: Status::Playing, focus: true });
@@ -985,6 +1000,19 @@ impl App {
                     paste = true;
                 }
                 if has_steps {
+                    let focus_label = if self.focus { "Exit focus" } else { "Focus" };
+                    if ui.add(egui::Button::new(focus_label).selected(self.focus)).on_hover_text("Give the checklist the whole window (Esc to leave)").clicked() {
+                        self.focus = !self.focus;
+                    }
+                    if ui
+                        .add(egui::Button::new("Compact").selected(self.compact_rows))
+                        .on_hover_text("One line per item: click the arrow (or hover) for its details")
+                        .clicked()
+                    {
+                        self.compact_rows = !self.compact_rows;
+                    }
+                }
+                if has_steps {
                     if ui.add(egui::Button::new("Full list").selected(!self.left_view)).clicked() {
                         self.left_view = false;
                     }
@@ -995,7 +1023,8 @@ impl App {
             });
         });
 
-        let App { lib, list_kind, list_scope, hide_done, list_search, list_section, left_view, collapsed, scroll_to_next, step_bufs, row_heights, .. } = self;
+        let compact = self.compact_rows;
+        let App { lib, list_kind, list_scope, hide_done, list_search, list_section, left_view, collapsed, scroll_to_next, step_bufs, row_heights, open_rows, .. } = self;
         let Some(game) = lib.game_mut(gid) else { return };
         let Some(guide) = game.guides.iter_mut().find(|g| g.id == aid) else { return };
         if untick {
@@ -1236,7 +1265,8 @@ impl App {
                     let can_find = web && !s.anchor.is_empty();
                     // Off-screen rows take their remembered height instead of being laid out.
                     let w = ui.available_width();
-                    let print = row_fingerprint(s, states[i], is_next, can_find, w);
+                    let open = open_rows.contains(&(aid, i));
+                    let print = row_fingerprint(s, states[i], is_next, can_find, w, compact, open);
                     if let Some(&(fp, h)) = row_heights.get(&(aid, i)) {
                         let r = Rect::from_min_size(ui.cursor().min, Vec2::new(w, h));
                         if fp == print && !(is_next && scroll_next) && !ui.is_rect_visible(r) {
@@ -1245,7 +1275,7 @@ impl App {
                             continue;
                         }
                     }
-                    let resp = step_row(ui, s, i, states[i], is_next, can_find, &mut acts);
+                    let resp = step_row(ui, s, i, states[i], is_next, can_find, compact, open, &mut acts);
                     row_heights.insert((aid, i), (print, resp.rect.height()));
                     if is_next && scroll_next {
                         resp.scroll_to_me(Some(Align::Center));
@@ -1288,6 +1318,11 @@ impl App {
                     progressed = true;
                 }
                 RowAct::Optional => guide.steps[i].optional = !guide.steps[i].optional,
+                RowAct::Details => {
+                    if !open_rows.remove(&(aid, i)) {
+                        open_rows.insert((aid, i));
+                    }
+                }
                 RowAct::Find => {
                     let s = &guide.steps[i];
                     let page = if s.url.is_empty() { &guide.url } else { &s.url };
@@ -2151,7 +2186,8 @@ impl App {
         });
 
         let gid = self.selected.filter(|id| self.lib.games.iter().any(|g| g.id == *id));
-        if let Some(gid) = gid.filter(|_| !self.explorer_open) {
+        let focusing = self.focus && gid.is_some_and(|id| self.lib.games.iter().any(|g| g.id == id && !g.guides.is_empty()));
+        if let Some(gid) = gid.filter(|_| !self.explorer_open && !focusing) {
             egui::SidePanel::right("journal").resizable(true).default_width(330.0).width_range(260.0..=520.0).frame(pad).show(ctx, |ui| {
                 contained(ui, |ui| {
                     window(ui, "Where I Left Off", |ui| self.resume_view(ui, gid));
@@ -2164,6 +2200,9 @@ impl App {
         egui::CentralPanel::default().frame(pad).show(ctx, |ui| match gid {
             _ if self.explorer_open => {
                 window(ui, "Explorer", |ui| self.explorer_view(ui));
+            }
+            Some(gid) if focusing => {
+                window(ui, "Checklist", |ui| self.checklist_view(ui, gid));
             }
             Some(gid) => {
                 window(ui, "Game", |ui| self.game_header(ui, gid));
@@ -2245,6 +2284,7 @@ impl eframe::App for App {
             folder_view: self.folder_view,
             closed_folders: self.closed_folders.clone(),
             ex_layout: self.ex_layout,
+            compact_rows: self.compact_rows,
             explorer_open: self.explorer_open,
             ex_path: self.ex_path.clone(),
             window_size: self.window_size.map(|s| [s.x, s.y]),
@@ -2288,7 +2328,8 @@ fn guide_card(ui: &mut Ui, g: &mut Guide, c: &mut CardCtx) -> Vec<CardAct> {
     let mut acts = Vec::new();
     let border = if c.last_used { MAGENTA } else { INDIGO };
     // Reference links (no checklist, nothing to fill in) take one line until expanded.
-    let compact = g.steps.is_empty() && !matches!(g.kind, Kind::Video | Kind::Sheet) && !c.expanded;
+    // Reference links, and guides whose checklist isn't the one on show, take one line until expanded.
+    let compact = (g.steps.is_empty() || !c.active) && !matches!(g.kind, Kind::Video | Kind::Sheet) && !c.expanded;
     let resp = egui::Frame::new()
         .fill(CARD_BG)
         .stroke(Stroke::new(1.0f32, border))
@@ -2352,6 +2393,12 @@ fn guide_card(ui: &mut Ui, g: &mut Guide, c: &mut CardCtx) -> Vec<CardAct> {
                             ui.close_menu();
                         }
                     });
+                    if compact && !g.steps.is_empty() {
+                        let label = format!("Checklist {}/{}", g.steps.iter().filter(|s| s.done).count(), g.steps.len());
+                        if ui.button(RichText::new(label).color(TEAL)).on_hover_text("Show this guide's checklist").clicked() {
+                            acts.push(CardAct::ShowChecklist);
+                        }
+                    }
                     let open = ui
                         .add(egui::Button::new(RichText::new("Resume").font(bold(16.0)).color(if c.last_used { MAGENTA } else { YELLOW })))
                         .on_hover_text(format!("Open at your saved spot\n{}", g.resume_url()));
@@ -2983,10 +3030,11 @@ fn game_row(ui: &mut Ui, g: &Game, sel: bool, n: usize, indent: f32, width: f32,
 }
 
 /// Everything that decides a checklist row's height. If it's unchanged, the remembered height holds.
-fn row_fingerprint(s: &Step, state: StepState, is_next: bool, can_find: bool, width: f32) -> u64 {
+#[allow(clippy::too_many_arguments)]
+fn row_fingerprint(s: &Step, state: StepState, is_next: bool, can_find: bool, width: f32, compact: bool, open: bool) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (&s.text, &s.detail, &s.how, &s.reward, &s.deadline, s.optional, s.hidden).hash(&mut h);
-    (state as u8, is_next, can_find, width.round() as i32).hash(&mut h);
+    (state as u8, is_next, can_find, width.round() as i32, compact, open).hash(&mut h);
     h.finish()
 }
 
@@ -3015,7 +3063,11 @@ fn tag(ui: &mut Ui, text: &str, col: Color32) {
 
 /// One checklist item: tick box, type icon, name, requirement, How and Reward.
 /// Clicking anywhere on the row ticks it.
-fn step_row(ui: &mut Ui, s: &Step, i: usize, state: StepState, is_next: bool, can_find: bool, acts: &mut Vec<(usize, RowAct)>) -> egui::Response {
+#[allow(clippy::too_many_arguments)]
+fn step_row(ui: &mut Ui, s: &Step, i: usize, state: StepState, is_next: bool, can_find: bool, compact: bool, open: bool, acts: &mut Vec<(usize, RowAct)>) -> egui::Response {
+    let has_details = !s.detail.is_empty() || !s.how.is_empty();
+    // compact rows show their details only when opened
+    let show_details = !compact || open;
     let done = state == StepState::Done;
     let missed = state == StepState::Missed;
     let faded = done || missed;
@@ -3036,7 +3088,8 @@ fn step_row(ui: &mut Ui, s: &Step, i: usize, state: StepState, is_next: bool, ca
             } else {
                 Stroke::new(1.0f32, if faded { Color32::from_rgb(0x2a, 0x26, 0x48) } else { INDIGO })
             };
-            egui::Frame::new().fill(fill).stroke(stroke).corner_radius(3).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+            let margin = if compact { egui::Margin::symmetric(8, 3) } else { egui::Margin::symmetric(10, 8) };
+            egui::Frame::new().fill(fill).stroke(stroke).corner_radius(3).inner_margin(margin).show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.horizontal_top(|ui| {
                     if big_checkbox(ui, done).on_hover_text(if done { "Untick" } else { "Tick off" }).clicked() {
@@ -3045,7 +3098,25 @@ fn step_row(ui: &mut Ui, s: &Step, i: usize, state: StepState, is_next: bool, ca
                     ui.add_space(4.0);
                     let (ir, _) = ui.allocate_exact_size(Vec2::new(22.0, 24.0), Sense::hover());
                     icons::step_icon(ui.painter(), Rect::from_center_size(ir.center(), Vec2::splat(20.0)), s.kind, faded);
-                    ui.add_space(4.0);
+                    if compact {
+                        // the arrow that opens this row's details
+                        let (ar, aresp) = ui.allocate_exact_size(Vec2::new(16.0, 24.0), if has_details { Sense::click() } else { Sense::hover() });
+                        if has_details {
+                            let col = if aresp.hovered() { TEAL } else { YELLOW };
+                            let k = ar.center();
+                            let tri = if open {
+                                vec![k + Vec2::new(-4.0, -2.0), k + Vec2::new(4.0, -2.0), k + Vec2::new(0.0, 3.0)]
+                            } else {
+                                vec![k + Vec2::new(-2.0, -4.0), k + Vec2::new(3.0, 0.0), k + Vec2::new(-2.0, 4.0)]
+                            };
+                            ui.painter().add(egui::Shape::convex_polygon(tri, col, Stroke::NONE));
+                            if aresp.on_hover_text(if open { "Hide details" } else { "Show details" }).clicked() {
+                                acts.push((i, RowAct::Details));
+                            }
+                        }
+                    } else {
+                        ui.add_space(4.0);
+                    }
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -3075,11 +3146,12 @@ fn step_row(ui: &mut Ui, s: &Step, i: usize, state: StepState, is_next: bool, ca
                                     } else {
                                         WHITE
                                     };
-                                    let mut t = RichText::new(&s.text).font(bold(18.0)).color(col);
+                                    let mut t = RichText::new(&s.text).font(bold(if compact { 16.0 } else { 18.0 })).color(col);
                                     if done {
                                         t = t.strikethrough();
                                     }
-                                    ui.add(egui::Label::new(t).wrap().selectable(false));
+                                    let label = egui::Label::new(t).selectable(false);
+                                    ui.add(if compact && !open { label.truncate() } else { label.wrap() });
                                     if s.hidden {
                                         ui.label(RichText::new("hidden").small().color(DIM));
                                     }
@@ -3088,10 +3160,10 @@ fn step_row(ui: &mut Ui, s: &Step, i: usize, state: StepState, is_next: bool, ca
                         });
                         // Finished items keep their full height (just dimmed) so nothing below
                         // them slides up under the mouse. "Hide done" removes them instead.
-                        if !s.detail.is_empty() {
+                        if show_details && !s.detail.is_empty() {
                             ui.add(egui::Label::new(RichText::new(&s.detail).color(if faded { DIM } else { YELLOW })).wrap().selectable(false));
                         }
-                        if !s.how.is_empty() {
+                        if show_details && !s.how.is_empty() {
                             ui.add_space(2.0);
                             let col = if faded { DIM.gamma_multiply(0.7) } else { DIM };
                             ui.add(egui::Label::new(RichText::new(format!("How: {}", s.how)).color(col)).wrap().selectable(false));
@@ -3101,6 +3173,21 @@ fn step_row(ui: &mut Ui, s: &Step, i: usize, state: StepState, is_next: bool, ca
             });
         })
         .response;
+    let resp = if compact && !open && has_details {
+        let mut tip = s.detail.clone();
+        if !s.how.is_empty() {
+            if !tip.is_empty() {
+                tip.push_str("\n\n");
+            }
+            tip.push_str(&format!("How: {}", s.how));
+        }
+        resp.on_hover_ui(|ui| {
+            ui.set_max_width(460.0);
+            ui.label(tip);
+        })
+    } else {
+        resp
+    };
     if is_next {
         glow_rect(ui.painter(), resp.rect, 3.0, MAGENTA, 5.0);
     }
@@ -3456,6 +3543,33 @@ mod tests {
         // opening a game closes the explorer and selects it
         app.ex_open_game(4);
         assert_eq!((app.explorer_open, app.selected), (false, Some(4)));
+    }
+
+    #[test]
+    fn focus_and_compact_rows() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let size = Vec2::new(1400.0, 850.0);
+        let checklist_height = |app: &mut App, ctx: &egui::Context| {
+            for _ in 0..3 {
+                run(app, ctx, size, vec![]);
+            }
+            // the first item's remembered height
+            app.row_heights.get(&(2, 0)).map(|h| h.1).unwrap_or(0.0)
+        };
+        let tall = checklist_height(&mut app, &ctx);
+        app.compact_rows = true;
+        let short = checklist_height(&mut app, &ctx);
+        assert!(short > 0.0 && short < tall * 0.6, "compact row {short}px vs normal {tall}px");
+        // opening a compact row's details makes it taller again
+        app.open_rows.insert((2, 0));
+        let opened = checklist_height(&mut app, &ctx);
+        assert!(opened > short + 20.0, "opened row {opened}px vs closed {short}px");
+        // focus mode draws only the checklist, and Esc leaves it
+        app.focus = true;
+        run(&mut app, &ctx, size, vec![]);
+        run(&mut app, &ctx, size, vec![egui::Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }]);
+        assert!(!app.focus);
     }
 
     #[test]

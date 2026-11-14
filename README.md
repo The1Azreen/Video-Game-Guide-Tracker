@@ -48,6 +48,10 @@ If you paste a link that already has `&t=95s` or `#range=A40` in it, JAGT keeps 
   - **What's left**: what's still to do, area by area. Click an item to tick it, or "Show these" to
     open the list at that area.
   - **Find in guide** opens the guide page scrolled to that item.
+  - **Focus** gives the checklist the whole window (Esc to leave). **Compact** shows one line per
+    item: click its arrow, or hover it, for the details.
+  - Guides whose checklist isn't the one on show fold to one line, with a **Checklist x/y**
+    button to switch to it.
   - Resume follows the story: it opens the guide at your next unticked story item, then optional
     ones once the story is done.
 - **Missable deadlines**: items can have an end date (from `End: 9/25` lines in a guide). Set the
