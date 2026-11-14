@@ -265,7 +265,12 @@ fn decode_entities(s: &str) -> String {
     while let Some(i) = rest.find('&') {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
-        let Some(end) = rest[..rest.len().min(12)].find(';') else {
+        // look for the ';' within the next 12 bytes, without cutting a multi-byte character
+        let mut window = rest.len().min(12);
+        while !rest.is_char_boundary(window) {
+            window -= 1;
+        }
+        let Some(end) = rest[..window].find(';') else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -311,6 +316,14 @@ fn decode_entities(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entities_next_to_non_ascii() {
+        // a bare '&' followed by curly quotes used to cut a character in half and crash
+        assert_eq!(decode_entities("Tom & Jerry\u{2019}s \u{2019}\u{2019}\u{2019}\u{2019}"), "Tom & Jerry\u{2019}s \u{2019}\u{2019}\u{2019}\u{2019}");
+        assert_eq!(decode_entities("&\u{2019}\u{2019}\u{2019}\u{2019}\u{2019}"), "&\u{2019}\u{2019}\u{2019}\u{2019}\u{2019}");
+        assert_eq!(decode_entities("Rock &amp; Roll\u{2019}s"), "Rock & Roll\u{2019}s");
+    }
 
     #[test]
     fn page_to_text() {
