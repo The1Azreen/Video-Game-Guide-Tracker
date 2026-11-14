@@ -27,8 +27,55 @@ pub fn unwrap_suspended(input: &str) -> Option<(String, Option<String>)> {
     Some((uri, title))
 }
 
+/// File types that can be added as guides from the PC (the "Add files" picker and drag-and-drop).
+pub const GUIDE_FILE_TYPES: [&str; 17] =
+    ["pdf", "txt", "md", "html", "htm", "mhtml", "xlsx", "xls", "csv", "ods", "doc", "docx", "odt", "epub", "png", "jpg", "jpeg"];
+
+pub fn is_guide_file(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| GUIDE_FILE_TYPES.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+pub fn is_local(url: &str) -> bool {
+    url.trim().to_ascii_lowercase().starts_with("file:")
+}
+
+/// `C:\Guides\Fate Extra.pdf` → `file:///C:/Guides/Fate%20Extra.pdf`
+pub fn file_url(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy().replace('\\', "/");
+    let mut out = String::from("file:///");
+    for b in s.trim_start_matches('/').bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~/:()".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// The path a `file:///` link points at.
+pub fn local_path(url: &str) -> Option<std::path::PathBuf> {
+    let u = url.trim();
+    let rest = u.get(..8).filter(|p| p.eq_ignore_ascii_case("file:///")).map(|_| &u[8..]).or_else(|| u.get(..7).filter(|p| p.eq_ignore_ascii_case("file://")).map(|_| &u[7..]))?;
+    let rest = rest.split('#').next().unwrap_or(rest);
+    let decoded = percent_decode(&rest.replace('+', "%2B"));
+    Some(std::path::PathBuf::from(if cfg!(windows) { decoded.replace('/', "\\") } else { format!("/{decoded}") }))
+}
+
+/// A pasted local path (`C:\Guides\x.pdf`, `"D:/maps/map.png"`) that exists, as a file link.
+fn existing_path(s: &str) -> Option<String> {
+    let s = s.trim().trim_matches('"');
+    let looks_like_path = s.get(1..3).is_some_and(|d| d == ":\\" || d == ":/") || s.starts_with("\\\\") || s.starts_with('/');
+    let p = std::path::Path::new(s);
+    (looks_like_path && p.is_file()).then(|| file_url(p))
+}
+
 /// Every link in a blob of pasted text (separated by spaces, new lines or commas).
 pub fn extract_all(text: &str) -> Vec<String> {
+    // a single pasted file path may contain spaces
+    if let Some(url) = existing_path(text) {
+        return vec![url];
+    }
     let mut out: Vec<String> = Vec::new();
     for token in text.split_whitespace() {
         let token = token.trim_matches([',', ';']);
@@ -45,10 +92,16 @@ pub fn normalize(input: &str) -> Option<String> {
         return normalize(&uri);
     }
     let s = input.trim().trim_matches(|c| c == '<' || c == '>' || c == '"');
+    if let Some(url) = existing_path(s) {
+        return Some(url);
+    }
     if s.is_empty() || s.contains(char::is_whitespace) {
         return None;
     }
     let lower = s.to_ascii_lowercase();
+    if lower.starts_with("file:///") {
+        return Some(s.to_string());
+    }
     if lower.starts_with("http://") || lower.starts_with("https://") {
         return Some(s.to_string());
     }
@@ -121,7 +174,11 @@ pub fn detect_kind(url: &str) -> Kind {
         || p.starts_with("/wiki/")
     {
         Kind::Wiki
-    } else if (h == "docs.google.com" && p.starts_with("/document")) || p.ends_with(".pdf") || p.ends_with(".txt") {
+    } else if [".png", ".jpg", ".jpeg", ".gif", ".webp"].iter().any(|e| p.ends_with(e)) {
+        Kind::Map
+    } else if (h == "docs.google.com" && p.starts_with("/document"))
+        || [".pdf", ".txt", ".md", ".doc", ".docx", ".odt", ".epub"].iter().any(|e| p.ends_with(e))
+    {
         Kind::Doc
     } else {
         Kind::Web
@@ -130,6 +187,9 @@ pub fn detect_kind(url: &str) -> Kind {
 
 /// A title to show until the real one has been fetched: "gamefaqs.gamespot.com — walkthrough".
 pub fn fallback_title(url: &str) -> String {
+    if let Some(name) = local_path(url).as_deref().and_then(|p| p.file_stem()).and_then(|n| n.to_str()) {
+        return name.to_string();
+    }
     let h = host(url);
     let last = path(url)
         .trim_end_matches('/')
@@ -227,6 +287,9 @@ pub fn sheet_row(url: &str) -> Option<u32> {
 
 pub fn resume_url(g: &Guide) -> String {
     let url = g.url.trim();
+    if is_local(url) {
+        return url.to_string(); // files open as they are; no scrolling to a phrase
+    }
     if is_youtube(url) {
         let (base, query, frag) = split(url);
         let mut q: Vec<String> = params(query).filter(|(k, _)| !["t", "start", "time_continue"].contains(k)).map(|(k, v)| join_kv(k, v)).collect();
@@ -417,6 +480,32 @@ mod tests {
         g.steps = vec![crate::model::Step { text: "Talk to Rin".into(), anchor: "Talk to Rin".into(), url: "https://example.com/week-1".into(), ..Default::default() }];
         g.follow_checklist(None);
         assert_eq!(resume_url(&g), "https://example.com/week-1#:~:text=Talk%20to%20Rin");
+    }
+
+    #[test]
+    fn local_files() {
+        let dir = std::env::temp_dir().join("jagt test guides");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Fate Extra map+notes.pdf");
+        std::fs::write(&file, b"%PDF").unwrap();
+
+        let url = file_url(&file);
+        assert!(url.starts_with("file:///") && url.contains("Fate%20Extra%20map%2Bnotes.pdf"), "{url}");
+        assert_eq!(local_path(&url).unwrap(), file);
+        assert!(is_local(&url));
+        // pasting the plain path (with spaces, even quoted) works
+        let pasted = format!("\"{}\"", file.display());
+        assert_eq!(normalize(&pasted).as_deref(), Some(url.as_str()));
+        assert_eq!(extract_all(&file.display().to_string()), vec![url.clone()]);
+        assert_eq!(detect_kind(&url), Kind::Doc);
+        assert_eq!(fallback_title(&url), "Fate Extra map+notes");
+        assert_eq!(detect_kind(&file_url(&dir.join("world map.png"))), Kind::Map);
+        assert_eq!(detect_kind(&file_url(&dir.join("100%.xlsx"))), Kind::Sheet);
+        assert!(is_guide_file(&file) && !is_guide_file(&dir.join("game.exe")));
+        let mut g = guide(&url);
+        g.jump_text = "Chapter 2".into();
+        assert_eq!(resume_url(&g), url, "files open without a text fragment");
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

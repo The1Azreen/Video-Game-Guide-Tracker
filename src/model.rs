@@ -12,6 +12,62 @@ pub fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// The explorer's top-level folders.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+pub enum Folder {
+    Pc,
+    Console,
+    Mobile,
+    Linux,
+    Other,
+}
+
+impl Folder {
+    pub const ALL: [Folder; 5] = [Folder::Pc, Folder::Console, Folder::Mobile, Folder::Linux, Folder::Other];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Folder::Pc => "PC",
+            Folder::Console => "Console",
+            Folder::Mobile => "Mobile",
+            Folder::Linux => "Linux",
+            Folder::Other => "Other",
+        }
+    }
+
+    /// Which folder a platform name belongs in: "PS5" → Console, "PC (Steam)" → PC,
+    /// "Switch 2" / "PSP" → Console, "Android" → Mobile, "Steam Deck" → Linux.
+    pub fn of_platform(platform: &str) -> Folder {
+        let p = platform.to_lowercase();
+        let words: Vec<&str> = p.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+        let has = |w: &str| words.contains(&w);
+        let any = |list: &[&str]| list.iter().any(|x| p.contains(x));
+        if p.trim().is_empty() {
+            Folder::Other
+        } else if any(&["linux", "steam deck", "steamdeck", "steamos", "ubuntu", "proton"]) {
+            Folder::Linux
+        } else if any(&["android", "iphone", "ipad", "ios", "mobile", "phone", "apple arcade"]) {
+            Folder::Mobile
+        } else if any(&["rog ally", "legion go", "msi claw"]) {
+            Folder::Pc
+        } else if any(&["playstation", "xbox", "nintendo", "wii", "gamecube", "n64", "snes", "nes", "sega", "genesis", "mega drive", "dreamcast", "saturn", "atari", "turbografx"])
+            || any(&["switch", "psp", "vita", "3ds", "game boy", "gameboy", "gba", "nds", "game gear", "neo geo pocket", "wonderswan"])
+            || has("ds")
+            || has("gb")
+            || has("gbc")
+            || words.iter().any(|w| w.starts_with("ps") && w[2..].chars().all(|c| c.is_ascii_digit()))
+            || has("ps")
+            || has("gc")
+        {
+            Folder::Console
+        } else if any(&["pc", "windows", "steam", "epic", "gog", "browser", "flash", "mac", "itch", "battle.net", "origin", "ea app", "ubisoft"]) {
+            Folder::Pc
+        } else {
+            Folder::Other
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum Status {
     #[default]
@@ -326,9 +382,15 @@ pub struct Game {
     pub last_guide: Option<u64>,
     /// Current in-game date as "M/D", for games with a calendar and missable deadlines.
     pub game_date: String,
+    /// Explorer folder chosen by hand; `None` = worked out from the platform.
+    pub folder: Option<Folder>,
 }
 
 impl Game {
+    pub fn folder(&self) -> Folder {
+        self.folder.unwrap_or_else(|| Folder::of_platform(&self.platform))
+    }
+
     pub fn today(&self) -> Option<(u32, u32)> {
         parse_md(&self.game_date)
     }
@@ -533,6 +595,41 @@ mod tests {
 
     fn st(text: &str, optional: bool, deadline: &str) -> Step {
         Step { text: text.into(), optional, deadline: deadline.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn platform_folders() {
+        use Folder::*;
+        for (p, f) in [
+            ("PS5", Console),
+            ("PS4", Console),
+            ("PlayStation 2", Console),
+            ("Xbox Series X", Console),
+            ("Wii U", Console),
+            ("PSP", Console),
+            ("PS Vita", Console),
+            ("Switch 2", Console),
+            ("Nintendo Switch", Console),
+            ("3DS", Console),
+            ("Game Boy Advance", Console),
+            ("PC (Steam)", Pc),
+            ("PC (Browser)", Pc),
+            ("Windows", Pc),
+            ("Steam", Pc),
+            ("ROG Ally", Pc),
+            ("Steam Deck", Linux),
+            ("Linux", Linux),
+            ("Android", Mobile),
+            ("iPhone", Mobile),
+            ("", Other),
+            ("Arcade cabinet", Other),
+        ] {
+            assert_eq!(Folder::of_platform(p), f, "{p}");
+        }
+        let mut g = Game { platform: "PS5".into(), ..Default::default() };
+        assert_eq!(g.folder(), Console);
+        g.folder = Some(Pc);
+        assert_eq!(g.folder(), Pc);
     }
 
     #[test]

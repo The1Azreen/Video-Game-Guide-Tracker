@@ -1,4 +1,6 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// No console window, in debug builds too (a cmd window opening next to the app is just noise).
+// The command-line options below borrow the terminal's console instead; see `use_parent_console`.
+#![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod app;
 mod checklist;
@@ -18,7 +20,28 @@ jagt [options]
   --html-to-text FILE      print the text that Fetch-from-guide-page reads from a saved page
   -h, --help    this text";
 
+/// The app has no console of its own. When an option that prints something is run from a
+/// terminal, attach to that terminal's console so the output shows up there. (Output redirected
+/// to a file or pipe works either way.)
+fn use_parent_console() {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn AttachConsole(process_id: u32) -> i32;
+        }
+        const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+        // SAFETY: plain Win32 call with a constant argument; failing (no parent console) is fine.
+        unsafe {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
+
 fn main() -> eframe::Result {
+    if std::env::args().any(|a| matches!(a.as_str(), "-h" | "--help" | "--parse-checklist" | "--html-to-text")) {
+        use_parent_console();
+    }
     let mut opts = app::Options::default();
     let mut size = [1280.0f32, 780.0];
     let mut args = std::env::args().skip(1);
@@ -59,7 +82,9 @@ fn main() -> eframe::Result {
         .with_title("JAGT — Just Another Guide Tracker")
         .with_app_id("jagt")
         .with_inner_size(size)
-        .with_min_inner_size([900.0, 560.0]);
+        .with_min_inner_size([900.0, 560.0])
+        // guide files and folders can be dropped onto the window
+        .with_drag_and_drop(true);
     if let Some(icon) = icon {
         viewport = viewport.with_icon(icon);
     }

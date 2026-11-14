@@ -176,3 +176,86 @@ pub fn step_icon(p: &Painter, r: Rect, kind: crate::model::StepKind, dim: bool) 
         }
     }
 }
+
+/// A pixel folder for the games explorer. `r` is about 20×16. Top-level folders are brighter.
+pub fn folder_icon(p: &Painter, r: Rect, open: bool, top: bool) {
+    let body_col = if top { YELLOW } else { Color32::from_rgb(0xC9, 0xA4, 0x3A) };
+    let back_col = Color32::from_rgb(0xB0, 0x80, 0x22);
+    let tab = Rect::from_min_size(r.min, Vec2::new(r.width() * 0.45, 4.0));
+    p.rect_filled(tab, 1.0, back_col);
+    let body = Rect::from_min_max(Pos2::new(r.left(), r.top() + 3.0), r.max);
+    p.rect_filled(body, 1.5, back_col);
+    if open {
+        // the front flap tilts forward
+        let flap = vec![
+            Pos2::new(r.left() + 3.0, r.top() + 7.0),
+            Pos2::new(r.right() + 1.0, r.top() + 7.0),
+            Pos2::new(r.right() - 2.0, r.bottom()),
+            Pos2::new(r.left(), r.bottom()),
+        ];
+        p.add(egui::Shape::convex_polygon(flap, body_col, Stroke::new(1.0f32, INK)));
+    } else {
+        let front = Rect::from_min_max(Pos2::new(r.left(), r.top() + 5.0), r.max);
+        p.rect_filled(front, 1.5, body_col);
+        p.rect_stroke(front, 1.5, Stroke::new(1.0f32, INK), StrokeKind::Inside);
+    }
+}
+
+/// A large explorer folder (Windows "Large icons" style). `peek` colours show as the edges of the
+/// items inside, sticking out of the top, like the files peeking out of a real folder icon.
+pub fn folder_big(p: &Painter, r: Rect, peek: &[Color32]) {
+    let w = r.width();
+    let h = r.height();
+    let back = Color32::from_rgb(0xD9, 0xA4, 0x2B);
+    let front = YELLOW;
+    // back panel with its tab
+    let tab = Rect::from_min_size(r.min, Vec2::new(w * 0.42, h * 0.16));
+    p.rect_filled(tab, 3.0, back);
+    let body = Rect::from_min_max(Pos2::new(r.left(), r.top() + h * 0.1), r.max);
+    p.rect_filled(body, 4.0, back);
+    // the things inside, peeking out
+    for (i, c) in peek.iter().take(3).enumerate() {
+        let x = r.left() + w * 0.14 + i as f32 * w * 0.2;
+        let sheet = Rect::from_min_size(Pos2::new(x, r.top() + h * 0.18 - i as f32 * 2.0), Vec2::new(w * 0.42, h * 0.5));
+        p.rect_filled(sheet, 2.0, Color32::from_gray(235));
+        p.rect_filled(Rect::from_min_size(sheet.min, Vec2::new(sheet.width(), h * 0.09)), 2.0, *c);
+        p.rect_stroke(sheet, 2.0, Stroke::new(1.0f32, Color32::from_gray(150)), StrokeKind::Inside);
+    }
+    // front panel
+    let front_r = Rect::from_min_max(Pos2::new(r.left(), r.top() + h * 0.36), r.max);
+    p.rect_filled(front_r, 4.0, front);
+    p.rect_filled(Rect::from_min_size(front_r.min, Vec2::new(front_r.width(), 3.0)), 2.0, Color32::from_rgb(0xFF, 0xE0, 0x80));
+    p.rect_stroke(front_r, 4.0, Stroke::new(1.5f32, INK), StrokeKind::Inside);
+}
+
+/// A game case tile: coloured spine band for the platform, the guide site's icon (or a pad) on the
+/// cover, and a strip at the bottom for the status colour.
+pub fn game_case(p: &Painter, r: Rect, band: Color32, cover: Option<egui::TextureId>, status: Color32) {
+    p.rect_filled(r, 4.0, Color32::from_rgb(0x2B, 0x27, 0x45));
+    p.rect_stroke(r, 4.0, Stroke::new(1.5f32, Color32::from_gray(200)), StrokeKind::Inside);
+    let top = Rect::from_min_size(r.min, Vec2::new(r.width(), r.height() * 0.17));
+    p.rect_filled(top, 4.0, band);
+    p.rect_filled(Rect::from_min_size(Pos2::new(r.left(), top.bottom() - 4.0), Vec2::new(r.width(), 4.0)), 0.0, band);
+    let art = Rect::from_center_size(Pos2::new(r.center().x, r.top() + r.height() * 0.56), Vec2::splat(r.width() * 0.55));
+    match cover {
+        Some(t) => {
+            p.rect_filled(art.expand(3.0), 3.0, Color32::from_gray(240));
+            p.image(t, art, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        }
+        None => filter_icon(p, art, Some(crate::model::Status::Playing)),
+    }
+    p.rect_filled(Rect::from_min_max(Pos2::new(r.left() + 4.0, r.bottom() - 6.0), Pos2::new(r.right() - 4.0, r.bottom() - 3.0)), 1.0, status);
+}
+
+/// Toolbar arrows: back (←), forward (→), up (↑).
+pub fn arrow(p: &Painter, r: Rect, dir: Vec2, col: Color32) {
+    let c = r.center();
+    let s = r.width().min(r.height()) * 0.32;
+    let tip = c + dir * s;
+    let tail = c - dir * s;
+    let side = Vec2::new(-dir.y, dir.x) * s * 0.7;
+    let st = Stroke::new(2.0f32, col);
+    p.line_segment([tail, tip], st);
+    p.line_segment([tip, tip - dir * s * 0.7 + side], st);
+    p.line_segment([tip, tip - dir * s * 0.7 - side], st);
+}

@@ -23,6 +23,19 @@ If you paste a link that already has `&t=95s` or `#range=A40` in it, JAGT keeps 
 ## Features
 
 - **Games** sorted by status (Playing, Backlog, Paused, Done, Dropped), with progress and when you last played.
+- **Folders**: the games list works like a file explorer, with **PC**, **Console**, **Mobile**,
+  **Linux** and **Other** folders, and a subfolder per platform when a folder holds several
+  (Console ▸ PS5, PSP, Switch 2…). The folder comes from the game's platform; change it with the
+  **Folder** dropdown or right-click ▸ Move to folder. **List** switches back to one flat list.
+- **Explorer**: the folder icon in the header opens a file-explorer window over the middle of
+  the app: big folders and game-case tiles (**Large icons**) or columns (**Details**), back /
+  forward / up, a clickable path (Games › Console › PS5) and a status bar. Double-click or Enter
+  opens a folder or a game, Backspace goes up, Alt+←/→ go back and forward. The folder tree on
+  the left works as its navigation pane. It reopens where you left it.
+- **Guide files from your PC**: **Add files** / **Add folder** in the header (or drag files and
+  folders onto the window) add PDFs, saved web pages, text, spreadsheets, documents and map images
+  as guides. They open in their own app; right-click ▸ **Show in folder**. Paste a file path into the
+  guide box to add a single file. **Paste checklist ▸ Open file…** reads a checklist from a saved page.
 - **Guides** are typed automatically from the link. The real page title and site icon are looked up for you.
 - **Checklists**: a full-size Checklist window under the guides. Paste a guide's text and JAGT
   splits it into areas (with their own counts, foldable), and items: chests, objectives,
@@ -50,6 +63,9 @@ If you paste a link that already has `&t=95s` or `#range=A40` in it, JAGT keeps 
 - **Continue** (or <kbd>Enter</kbd>): reopens the last guide you used at your saved spot.
 - **Paste anywhere**: <kbd>Ctrl</kbd>+<kbd>V</kbd> with a link copied adds it to the current game.
 - **Online: off** stops all network use. Icons that are already cached still show.
+- **Light on your PC**: off-screen checklist items aren't redrawn, and while JAGT isn't the active
+  window the stars stop and it redraws about once a second. **Settings ▸ Animated background**
+  turns the drifting stars off entirely.
 
 ## Your data
 

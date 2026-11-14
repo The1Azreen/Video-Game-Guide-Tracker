@@ -8,7 +8,7 @@ use egui::{Align, Align2, Color32, Key, Layout, Pos2, Rect, RichText, Sense, Str
 use crate::icons;
 use crate::links;
 use crate::checklist;
-use crate::model::{self, Game, Guide, Kind, Library, LogEntry, Status, Step, StepKind, StepState};
+use crate::model::{self, Folder, Game, Guide, Kind, Library, LogEntry, Status, Step, StepKind, StepState};
 use crate::online::{self, Done, Job, Online};
 use crate::theme::*;
 
@@ -31,13 +31,24 @@ struct Saved {
     selected: Option<u64>,
     online: bool,
     glow: bool,
+    /// Drifting stars. Off = a still background and far fewer redraws.
+    animate: bool,
+    /// Games panel: folders (true) or one flat list.
+    folder_view: bool,
+    /// Explorer folders the user closed ("Console", "Console/ps5"...).
+    closed_folders: Vec<String>,
+    /// The explorer window's view: large icons or details.
+    ex_layout: ExplorerLayout,
+    /// Reopen the explorer where it was left.
+    explorer_open: bool,
+    ex_path: Vec<String>,
     window_size: Option<[f32; 2]>,
     maximized: bool,
 }
 
 impl Default for Saved {
     fn default() -> Self {
-        Saved { filter: None, selected: None, online: true, glow: true, window_size: None, maximized: false }
+        Saved { filter: None, selected: None, online: true, glow: true, animate: true, folder_view: true, closed_folders: Vec::new(), ex_layout: ExplorerLayout::Icons, explorer_open: false, ex_path: Vec::new(), window_size: None, maximized: false }
     }
 }
 
@@ -63,6 +74,7 @@ enum CardAct {
     Refetch,
     BulkSteps,
     ShowChecklist,
+    ShowInFolder,
 }
 
 /// What a checklist row asks for.
@@ -88,6 +100,20 @@ pub struct App {
     search: String,
     online_on: bool,
     glow: bool,
+    animate: bool,
+    folder_view: bool,
+    closed_folders: Vec<String>,
+    ex_layout: ExplorerLayout,
+    /// The explorer window is showing (instead of the selected game).
+    explorer_open: bool,
+    /// Where the explorer is: [] = top, ["Console"], ["Console", "PS5"].
+    ex_path: Vec<String>,
+    ex_back: Vec<Vec<String>>,
+    ex_fwd: Vec<Vec<String>>,
+    ex_sel: Option<ExplorerItem>,
+    /// Checklist rows' last drawn height, keyed by (guide, item), with a fingerprint of what was
+    /// drawn. Rows scrolled out of view reuse it instead of being laid out again.
+    row_heights: HashMap<(u64, usize), (u64, f32)>,
     online: Online,
     favicons: HashMap<String, Fav>,
 
@@ -171,6 +197,16 @@ impl App {
             search: String::new(),
             online_on: saved.online,
             glow: saved.glow,
+            animate: saved.animate,
+            folder_view: saved.folder_view,
+            closed_folders: saved.closed_folders,
+            ex_layout: saved.ex_layout,
+            explorer_open: saved.explorer_open,
+            ex_path: saved.ex_path,
+            ex_back: Vec::new(),
+            ex_fwd: Vec::new(),
+            ex_sel: None,
+            row_heights: HashMap::new(),
             online: Online::new(ctx.clone()),
             favicons: HashMap::new(),
             expanded: HashSet::new(),
@@ -285,11 +321,45 @@ impl App {
         if game.last_guide.is_none() {
             game.last_guide = Some(id);
         }
-        if self.online_on && known_title.is_none() {
+        if self.online_on && known_title.is_none() && !links::is_local(&url) {
             self.online.send(Job::Title { game: game_id, guide: id, url });
         }
         self.set_status(format!("Added {}", kind.label().to_lowercase()));
         true
+    }
+
+    /// Adds files (and every guide file inside folders, recursively) to the selected game.
+    fn add_paths(&mut self, paths: Vec<PathBuf>) {
+        if self.selected.is_none() {
+            self.set_status("Pick or add a game first, then add its guide files");
+            return;
+        }
+        let mut files = Vec::new();
+        for p in &paths {
+            collect_guide_files(p, &mut files, 0);
+        }
+        if files.is_empty() {
+            self.set_status("No guide files there (PDF, text, web pages, spreadsheets, images, documents)");
+            return;
+        }
+        let total = files.len();
+        let added = files.iter().filter(|f| self.add_guide(&links::file_url(f))).count();
+        if total > 1 || added == 0 {
+            self.set_status(format!("Added {added} of {total} files"));
+        }
+    }
+
+    fn pick_files(&mut self) {
+        let types: Vec<&str> = links::GUIDE_FILE_TYPES.to_vec();
+        if let Some(files) = rfd::FileDialog::new().set_title("Add guide files").add_filter("Guide files", &types).add_filter("All files", &["*"]).pick_files() {
+            self.add_paths(files);
+        }
+    }
+
+    fn pick_folder(&mut self) {
+        if let Some(dir) = rfd::FileDialog::new().set_title("Add every guide file in a folder").pick_folder() {
+            self.add_paths(vec![dir]);
+        }
     }
 
     fn open_guide(&mut self, game_id: u64, guide_id: u64) {
@@ -300,6 +370,17 @@ impl App {
         let spot = g.spot();
         game.last_guide = Some(guide_id);
         game.touch();
+        if let Some(path) = links::local_path(&url) {
+            if !path.exists() {
+                self.set_status_for(format!("File not found: {}", path.display()), 6.0);
+                return;
+            }
+            match open::that_detached(&path) {
+                Ok(()) => self.set_status("Opened the file"),
+                Err(e) => self.set_status_for(format!("Couldn't open the file: {e}"), 6.0),
+            }
+            return;
+        }
         match open::that_detached(&url) {
             Ok(()) => self.set_status(if spot.is_empty() { "Opened in your browser".to_string() } else { format!("Opened {spot}") }),
             Err(e) => self.set_status_for(format!("Couldn't open the browser: {e}"), 6.0),
@@ -491,6 +572,10 @@ impl App {
                     self.filter = f;
                 }
             }
+            ui.add_space(10.0);
+            if explorer_icon(ui, self.explorer_open).clicked() {
+                self.explorer_open = !self.explorer_open;
+            }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(8.0);
@@ -512,6 +597,23 @@ impl App {
                 if ui.add(egui::Button::new("Settings").selected(self.show_settings)).clicked() {
                     self.show_settings = !self.show_settings;
                 }
+                let has_game = self.selected.is_some();
+                if ui
+                    .add_enabled(has_game, egui::Button::new("Add folder"))
+                    .on_hover_text("Add every guide file in a folder to this game")
+                    .on_disabled_hover_text("Pick a game first")
+                    .clicked()
+                {
+                    self.pick_folder();
+                }
+                if ui
+                    .add_enabled(has_game, egui::Button::new("Add files"))
+                    .on_hover_text("Add guide files from your PC to this game: PDFs, saved pages, spreadsheets, maps...\nYou can also drop files or folders onto the window.")
+                    .on_disabled_hover_text("Pick a game first")
+                    .clicked()
+                {
+                    self.pick_files();
+                }
                 if ui.button("+ Add game").on_hover_text("Ctrl+N").clicked() {
                     self.add_game = Some(NewGame { title: String::new(), platform: String::new(), status: Status::Playing, focus: true });
                 }
@@ -527,6 +629,14 @@ impl App {
         if add {
             self.add_game = Some(NewGame { title: String::new(), platform: String::new(), status: self.filter.unwrap_or(Status::Playing), focus: true });
         }
+        ui.horizontal(|ui| {
+            if ui.selectable_label(self.folder_view, "Folders").on_hover_text("Group games into PC / Console / Mobile / Linux folders").clicked() {
+                self.folder_view = true;
+            }
+            if ui.selectable_label(!self.folder_view, "List").on_hover_text("One flat list").clicked() {
+                self.folder_view = false;
+            }
+        });
         let ids = self.sorted_ids();
         if ids.is_empty() {
             ui.add_space(20.0);
@@ -546,70 +656,91 @@ impl App {
         }
 
         let width = ui.available_width();
-        let mut set_status: Option<(u64, Status)> = None;
+        let mut acts: Vec<GameAct> = Vec::new();
+        let mut toggle: Option<String> = None;
+        let mut nav: Option<Vec<String>> = None;
+        let explorer = self.explorer_open;
+        let searching = !self.search.trim().is_empty();
+        let games: Vec<&Game> = ids.iter().filter_map(|id| self.lib.games.iter().find(|g| g.id == *id)).collect();
+        let selected = self.selected;
+        let closed = &self.closed_folders;
+        let is_open = |key: &str| searching || !closed.iter().any(|k| k == key);
+
         egui::ScrollArea::vertical().id_salt("games").auto_shrink([false, false]).show(ui, |ui| {
-            for (n, id) in ids.iter().enumerate() {
-                let Some(g) = self.lib.games.iter().find(|g| g.id == *id) else { continue };
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, GAME_ROW_H), Sense::click());
-                let p = ui.painter();
-                let sel = self.selected == Some(g.id);
-                let bg = if sel {
-                    INDIGO
-                } else if resp.hovered() {
-                    HOVER_BG
-                } else if n % 2 == 1 {
-                    CARD_BG
-                } else {
-                    Color32::TRANSPARENT
-                };
-                p.rect_filled(rect, 0.0, bg);
-                if sel {
-                    p.rect_stroke(rect.shrink(0.5), 0.0, Stroke::new(1.0f32, MAGENTA), StrokeKind::Inside);
-                    glow_rect(p, rect, 0.0, MAGENTA, 4.0);
+            if !self.folder_view {
+                for (n, g) in games.iter().enumerate() {
+                    game_row(ui, g, selected == Some(g.id), n, 0.0, width, &mut acts);
                 }
-                p.rect_filled(Rect::from_min_size(rect.min, Vec2::new(4.0, rect.height())), 0.0, g.status.color());
-
-                let inner = rect.shrink2(Vec2::new(10.0, 4.0));
-                let clip = p.with_clip_rect(inner.intersect(p.clip_rect()));
-                clip.text(inner.left_top() + Vec2::new(2.0, 0.0), Align2::LEFT_TOP, &g.title, bold(16.0), if sel { YELLOW } else { WHITE });
-                let mut sub = vec![g.status.label().to_string()];
-                if !g.platform.is_empty() {
-                    sub.push(g.platform.clone());
+                return;
+            }
+            let mut n = 0;
+            for f in Folder::ALL {
+                let in_folder: Vec<&&Game> = games.iter().filter(|g| g.folder() == f).collect();
+                if in_folder.is_empty() {
+                    continue;
                 }
-                sub.push(match g.guides.len() {
-                    1 => "1 guide".into(),
-                    n => format!("{n} guides"),
-                });
-                if let Some(t) = g.last_played {
-                    sub.push(model::ago(t));
+                let key = f.label().to_string();
+                let open = is_open(&key);
+                if folder_row(ui, f.label(), in_folder.len(), open, 0, width).clicked() {
+                    if explorer {
+                        nav = Some(vec![key.clone()]);
+                    } else {
+                        toggle = Some(key.clone());
+                    }
                 }
-                clip.text(inner.left_top() + Vec2::new(2.0, 19.0), Align2::LEFT_TOP, sub.join(" · "), pixel(12.0), DIM);
-
-                let pr = g.progress();
-                let bar = Rect::from_min_max(Pos2::new(inner.left() + 2.0, inner.bottom() - 4.0), Pos2::new(inner.right() - 34.0, inner.bottom() - 1.0));
-                p.rect_filled(bar, 1.0, INK);
-                p.rect_filled(Rect::from_min_max(bar.min, Pos2::new(bar.left() + bar.width() * pr, bar.bottom())), 1.0, g.status.color());
-                p.text(Pos2::new(inner.right(), bar.center().y), Align2::RIGHT_CENTER, format!("{:.0}%", pr * 100.0), pixel(12.0), TEAL);
-
-                if resp.clicked() {
-                    self.selected = Some(g.id);
+                if !open {
+                    continue;
                 }
-                resp.context_menu(|ui| {
-                    ui.label(RichText::new("Set status").color(TEAL));
-                    for s in Status::ALL {
-                        if ui.selectable_label(g.status == s, s.label()).clicked() {
-                            set_status = Some((g.id, s));
-                            ui.close_menu();
+                // a subfolder per platform, when the folder holds more than one
+                let mut platforms: Vec<String> = Vec::new();
+                for g in &in_folder {
+                    let name = platform_name(&g.platform);
+                    if !platforms.iter().any(|p| p.eq_ignore_ascii_case(&name)) {
+                        platforms.push(name);
+                    }
+                }
+                platforms.sort_by_key(|p| p.to_lowercase());
+                if platforms.len() < 2 {
+                    for g in &in_folder {
+                        game_row(ui, g, selected == Some(g.id), n, 1.0, width, &mut acts);
+                        n += 1;
+                    }
+                    continue;
+                }
+                for pl in &platforms {
+                    let here: Vec<&&&Game> = in_folder.iter().filter(|g| platform_name(&g.platform).eq_ignore_ascii_case(pl)).collect();
+                    let sub = format!("{key}/{}", pl.to_lowercase());
+                    let open = is_open(&sub);
+                    if folder_row(ui, pl, here.len(), open, 1, width).clicked() {
+                        if explorer {
+                            nav = Some(vec![key.clone(), pl.clone()]);
+                        } else {
+                            toggle = Some(sub.clone());
                         }
                     }
-                });
+                    if open {
+                        for g in here {
+                            game_row(ui, g, selected == Some(g.id), n, 2.0, width, &mut acts);
+                            n += 1;
+                        }
+                    }
+                }
             }
         });
-        if let Some((id, s)) = set_status {
-            if let Some(g) = self.lib.game_mut(id) {
-                g.status = s;
+
+        if let Some(key) = toggle {
+            if let Some(i) = self.closed_folders.iter().position(|k| *k == key) {
+                self.closed_folders.remove(i);
+            } else {
+                self.closed_folders.push(key);
             }
         }
+        if let Some(path) = nav {
+            // the tree is the explorer's navigation pane: open the folder there, and here
+            self.closed_folders.retain(|k| *k != path[0] && !path.get(1).is_some_and(|pl| *k == format!("{}/{}", path[0], pl.to_lowercase())));
+            self.ex_go(path);
+        }
+        self.apply_game_acts(acts);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -623,6 +754,21 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Platform").color(TEAL));
             ui.add(egui::TextEdit::singleline(&mut g.platform).hint_text("PS5, Switch, PC…").desired_width(130.0));
+            ui.add_space(6.0);
+            ui.label(RichText::new("Folder").color(TEAL));
+            let auto = Folder::of_platform(&g.platform);
+            let shown = match g.folder {
+                Some(f) => f.label().to_string(),
+                None => format!("Auto ({})", auto.label()),
+            };
+            egui::ComboBox::from_id_salt(("folder", gid)).selected_text(shown).show_ui(ui, |ui| {
+                ui.selectable_value(&mut g.folder, None, format!("Automatic ({})", auto.label()));
+                for f in Folder::ALL {
+                    ui.selectable_value(&mut g.folder, Some(f), f.label());
+                }
+            })
+            .response
+            .on_hover_text("Which folder this game sits in on the left. Automatic goes by the platform.");
             ui.add_space(6.0);
             ui.label(RichText::new("Status").color(TEAL));
             egui::ComboBox::from_id_salt(("status", gid)).selected_text(RichText::new(g.status.label()).color(g.status.color())).show_ui(ui, |ui| {
@@ -771,6 +917,13 @@ impl App {
                     self.active_list = Some(id);
                 }
                 CardAct::ShowChecklist => self.active_list = Some(id),
+                CardAct::ShowInFolder => {
+                    if let Some(path) = links::local_path(&game.guides[i].url) {
+                        if let Err(e) = show_in_folder(&path) {
+                            self.set_status_for(format!("Couldn't open the folder: {e}"), 6.0);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -842,7 +995,7 @@ impl App {
             });
         });
 
-        let App { lib, list_kind, list_scope, hide_done, list_search, list_section, left_view, collapsed, scroll_to_next, step_bufs, .. } = self;
+        let App { lib, list_kind, list_scope, hide_done, list_search, list_section, left_view, collapsed, scroll_to_next, step_bufs, row_heights, .. } = self;
         let Some(game) = lib.game_mut(gid) else { return };
         let Some(guide) = game.guides.iter_mut().find(|g| g.id == aid) else { return };
         if untick {
@@ -1048,7 +1201,7 @@ impl App {
                     None => areas.push((s.section.clone(), d, 1)),
                 }
             }
-            let web = guide.kind != Kind::Video && guide.kind != Kind::Sheet;
+            let web = guide.kind != Kind::Video && guide.kind != Kind::Sheet && !links::is_local(&guide.url);
             let shown = guide.steps.iter().enumerate().filter(|(i, s)| visible(*i, s)).count();
             let scroll_next = std::mem::take(scroll_to_next);
             let mut toggle_section = None;
@@ -1080,7 +1233,20 @@ impl App {
                         continue;
                     }
                     let is_next = next == Some(i);
-                    let resp = step_row(ui, s, i, states[i], is_next, web && !s.anchor.is_empty(), &mut acts);
+                    let can_find = web && !s.anchor.is_empty();
+                    // Off-screen rows take their remembered height instead of being laid out.
+                    let w = ui.available_width();
+                    let print = row_fingerprint(s, states[i], is_next, can_find, w);
+                    if let Some(&(fp, h)) = row_heights.get(&(aid, i)) {
+                        let r = Rect::from_min_size(ui.cursor().min, Vec2::new(w, h));
+                        if fp == print && !(is_next && scroll_next) && !ui.is_rect_visible(r) {
+                            ui.allocate_space(Vec2::new(w, h));
+                            ui.add_space(4.0);
+                            continue;
+                        }
+                    }
+                    let resp = step_row(ui, s, i, states[i], is_next, can_find, &mut acts);
+                    row_heights.insert((aid, i), (print, resp.rect.height()));
                     if is_next && scroll_next {
                         resp.scroll_to_me(Some(Align::Center));
                     }
@@ -1181,6 +1347,288 @@ impl App {
 
     // -----------------------------------------------------------------------------------------
     // Journal (right)
+
+    // -----------------------------------------------------------------------------------------
+    // Explorer (centre): the games as folders and tiles, like a file explorer window
+
+    fn ex_go(&mut self, path: Vec<String>) {
+        if path != self.ex_path {
+            self.ex_back.push(std::mem::replace(&mut self.ex_path, path));
+            self.ex_fwd.clear();
+            self.ex_sel = None;
+        }
+    }
+
+    fn ex_open_game(&mut self, id: u64) {
+        self.selected = Some(id);
+        self.explorer_open = false;
+    }
+
+    fn explorer_view(&mut self, ui: &mut Ui) {
+        // ---- toolbar: back / forward / up, the path, search and view
+        let mut go: Option<Vec<String>> = None;
+        let (mut back, mut fwd) = (false, false);
+        ui.horizontal(|ui| {
+            if tool_arrow(ui, Vec2::new(-1.0, 0.0), !self.ex_back.is_empty(), "Back (Alt+Left)").clicked() {
+                back = true;
+            }
+            if tool_arrow(ui, Vec2::new(1.0, 0.0), !self.ex_fwd.is_empty(), "Forward (Alt+Right)").clicked() {
+                fwd = true;
+            }
+            if tool_arrow(ui, Vec2::new(0.0, -1.0), !self.ex_path.is_empty(), "Up one folder (Backspace)").clicked() {
+                go = Some(self.ex_path[..self.ex_path.len() - 1].to_vec());
+            }
+            ui.add_space(4.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.selectable_label(self.ex_layout == ExplorerLayout::Details, "Details").clicked() {
+                    self.ex_layout = ExplorerLayout::Details;
+                }
+                if ui.selectable_label(self.ex_layout == ExplorerLayout::Icons, "Large icons").clicked() {
+                    self.ex_layout = ExplorerLayout::Icons;
+                }
+                ui.add(egui::TextEdit::singleline(&mut self.search).id_salt("explorer-search").hint_text("Search games…").desired_width(150.0));
+                // the breadcrumb takes what's left
+                let w = ui.available_width();
+                ui.allocate_ui_with_layout(Vec2::new(w, ui.spacing().interact_size.y + 6.0), Layout::left_to_right(Align::Center), |ui| {
+                    egui::Frame::new().fill(INK).stroke(Stroke::new(1.5f32, YELLOW)).corner_radius(2).inner_margin(egui::Margin::symmetric(6, 2)).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let (ir, _) = ui.allocate_exact_size(Vec2::new(18.0, 14.0), Sense::hover());
+                        icons::folder_icon(ui.painter(), ir, true, true);
+                        if crumb(ui, "Games", self.ex_path.is_empty()).clicked() {
+                            go = Some(Vec::new());
+                        }
+                        for (i, part) in self.ex_path.iter().enumerate() {
+                            ui.label(RichText::new(">").color(DIM));
+                            if crumb(ui, part, i + 1 == self.ex_path.len()).clicked() {
+                                go = Some(self.ex_path[..=i].to_vec());
+                            }
+                        }
+                    });
+                });
+            });
+        });
+        if back {
+            if let Some(p) = self.ex_back.pop() {
+                self.ex_fwd.push(std::mem::replace(&mut self.ex_path, p));
+                self.ex_sel = None;
+            }
+        }
+        if fwd {
+            if let Some(p) = self.ex_fwd.pop() {
+                self.ex_back.push(std::mem::replace(&mut self.ex_path, p));
+                self.ex_sel = None;
+            }
+        }
+        if let Some(p) = go.take() {
+            self.ex_go(p);
+        }
+
+        // ---- what's in this folder
+        let ids = self.sorted_ids();
+        let games: Vec<&Game> = ids.iter().filter_map(|id| self.lib.games.iter().find(|g| g.id == *id)).collect();
+        let (folders, game_ids) = match explorer_children(&games, &self.ex_path) {
+            Some(c) => c,
+            None => {
+                // the folder no longer exists (games moved or filtered away): back to the top
+                self.ex_path.clear();
+                explorer_children(&games, &[]).unwrap_or_default()
+            }
+        };
+        let folder_tiles: Vec<(String, usize, Vec<Color32>)> = folders
+            .iter()
+            .map(|(name, ids)| {
+                let peek = ids.iter().filter_map(|id| games.iter().find(|g| g.id == *id)).map(|g| platform_color(&g.platform)).collect();
+                (name.clone(), ids.len(), peek)
+            })
+            .collect();
+        let tiles: Vec<GameTile> = game_ids
+            .iter()
+            .filter_map(|id| games.iter().find(|g| g.id == *id))
+            .map(|g| GameTile {
+                id: g.id,
+                title: g.title.clone(),
+                platform: g.platform.clone(),
+                status: g.status,
+                folder: g.folder,
+                progress: g.progress(),
+                last_played: g.last_played,
+                host: g.guides.first().map(|x| links::host(&x.url)).unwrap_or_default(),
+            })
+            .collect();
+        drop(games);
+        for t in &tiles {
+            self.want_favicon(&t.host.clone());
+        }
+        let covers: Vec<Option<egui::TextureId>> = tiles
+            .iter()
+            .map(|t| match self.favicons.get(&t.host) {
+                Some(Fav::Ready(tex)) => Some(tex.id()),
+                _ => None,
+            })
+            .collect();
+
+        // ---- keyboard: Backspace up, Enter open, Alt+arrows back/forward
+        let typing = ui.ctx().memory(|m| m.focused().is_some());
+        let mut open_item: Option<ExplorerItem> = None;
+        if !typing {
+            let (bksp, enter, alt_l, alt_r) = ui.input_mut(|i| {
+                (
+                    i.consume_key(egui::Modifiers::NONE, Key::Backspace),
+                    i.consume_key(egui::Modifiers::NONE, Key::Enter),
+                    i.consume_key(egui::Modifiers::ALT, Key::ArrowLeft),
+                    i.consume_key(egui::Modifiers::ALT, Key::ArrowRight),
+                )
+            });
+            if bksp && !self.ex_path.is_empty() {
+                go = Some(self.ex_path[..self.ex_path.len() - 1].to_vec());
+            }
+            if enter {
+                open_item = self.ex_sel.clone();
+            }
+            if alt_l {
+                if let Some(p) = self.ex_back.pop() {
+                    self.ex_fwd.push(std::mem::replace(&mut self.ex_path, p));
+                }
+            }
+            if alt_r {
+                if let Some(p) = self.ex_fwd.pop() {
+                    self.ex_back.push(std::mem::replace(&mut self.ex_path, p));
+                }
+            }
+        }
+
+        // ---- the items
+        let mut acts: Vec<GameAct> = Vec::new();
+        let mut select: Option<ExplorerItem> = None;
+        let total = folder_tiles.len() + tiles.len();
+        let sel = self.ex_sel.clone();
+        let layout = self.ex_layout;
+        let status_h = 22.0;
+        let list_h = (ui.available_height() - status_h - 8.0).max(80.0);
+        ui.add_space(4.0);
+        egui::ScrollArea::vertical().id_salt(("explorer", self.ex_path.join("/"))).auto_shrink([false, false]).max_height(list_h).show(ui, |ui| {
+            ui.set_min_height(list_h);
+            if total == 0 {
+                ui.add_space(30.0);
+                ui.vertical_centered(|ui| ui.label(RichText::new("This folder is empty.").color(DIM)));
+                return;
+            }
+            match layout {
+                ExplorerLayout::Icons => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(10.0, 10.0);
+                        for (name, count, peek) in &folder_tiles {
+                            let item = ExplorerItem::Folder(name.clone());
+                            let r = folder_tile(ui, name, *count, peek, sel.as_ref() == Some(&item));
+                            if r.double_clicked() {
+                                open_item = Some(item);
+                            } else if r.clicked() {
+                                select = Some(item);
+                            }
+                        }
+                        for (t, cover) in tiles.iter().zip(&covers) {
+                            let item = ExplorerItem::Game(t.id);
+                            let r = game_tile(ui, t, *cover, sel.as_ref() == Some(&item));
+                            if r.double_clicked() {
+                                open_item = Some(item);
+                            } else if r.clicked() {
+                                select = Some(item);
+                            }
+                            r.context_menu(|ui| game_menu(ui, t.id, t.status, t.folder, &t.platform, &mut acts));
+                        }
+                    });
+                }
+                ExplorerLayout::Details => {
+                    let w = ui.available_width();
+                    details_header(ui, w);
+                    for (n, (name, count, _)) in folder_tiles.iter().enumerate() {
+                        let item = ExplorerItem::Folder(name.clone());
+                        let r = details_row(ui, w, n, sel.as_ref() == Some(&item), None, name, &if *count == 1 { "Folder · 1 game".to_string() } else { format!("Folder · {count} games") }, "", None, "");
+                        if r.double_clicked() {
+                            open_item = Some(item);
+                        } else if r.clicked() {
+                            select = Some(item);
+                        }
+                    }
+                    for (k, t) in tiles.iter().enumerate() {
+                        let item = ExplorerItem::Game(t.id);
+                        let played = t.last_played.map(model::ago).unwrap_or_else(|| "not yet".into());
+                        let r = details_row(
+                            ui,
+                            w,
+                            folder_tiles.len() + k,
+                            sel.as_ref() == Some(&item),
+                            Some(platform_color(&t.platform)),
+                            &t.title,
+                            &t.platform,
+                            t.status.label(),
+                            Some((t.progress, t.status.color())),
+                            &played,
+                        );
+                        if r.double_clicked() {
+                            open_item = Some(item);
+                        } else if r.clicked() {
+                            select = Some(item);
+                        }
+                        r.context_menu(|ui| game_menu(ui, t.id, t.status, t.folder, &t.platform, &mut acts));
+                    }
+                }
+            }
+        });
+
+        // ---- status bar, like Explorer's
+        ui.separator();
+        ui.horizontal(|ui| {
+            let items = if total == 1 { "1 item".to_string() } else { format!("{total} items") };
+            ui.label(RichText::new(items).small().color(DIM));
+            if let Some(ExplorerItem::Game(id)) = &self.ex_sel {
+                if let Some(t) = tiles.iter().find(|t| t.id == *id) {
+                    ui.label(RichText::new(format!("·  {} selected: {} · {:.0}%  (double-click or Enter to open)", t.title, t.status.label(), t.progress * 100.0)).small().color(TEAL));
+                }
+            } else if let Some(ExplorerItem::Folder(f)) = &self.ex_sel {
+                ui.label(RichText::new(format!("·  {f} selected  (double-click or Enter to open)")).small().color(TEAL));
+            }
+        });
+
+        if let Some(s) = select {
+            self.ex_sel = Some(s);
+        }
+        match open_item {
+            Some(ExplorerItem::Folder(name)) => {
+                let mut p = self.ex_path.clone();
+                p.push(name);
+                self.ex_go(p);
+            }
+            Some(ExplorerItem::Game(id)) => self.ex_open_game(id),
+            None => {}
+        }
+        if let Some(p) = go {
+            self.ex_go(p);
+        }
+        self.apply_game_acts(acts);
+    }
+
+    fn apply_game_acts(&mut self, acts: Vec<GameAct>) {
+        for a in acts {
+            match a {
+                GameAct::Select(id) => {
+                    self.selected = Some(id);
+                    self.explorer_open = false;
+                }
+                GameAct::Status(id, s) => {
+                    if let Some(g) = self.lib.game_mut(id) {
+                        g.status = s;
+                    }
+                }
+                GameAct::Folder(id, f) => {
+                    if let Some(g) = self.lib.game_mut(id) {
+                        g.folder = f;
+                    }
+                }
+            }
+        }
+    }
 
     fn resume_view(&mut self, ui: &mut Ui, gid: u64) {
         let Some(g) = self.lib.game_mut(gid) else { return };
@@ -1379,7 +1827,7 @@ impl App {
             .iter()
             .flat_map(|g| &g.guides)
             .find(|g| g.id == guide_id)
-            .map_or((String::new(), 0, false), |g| (g.url.clone(), g.steps.len(), g.kind != Kind::Video && g.kind != Kind::Sheet));
+            .map_or((String::new(), 0, false), |g| (g.url.clone(), g.steps.len(), g.kind != Kind::Video && g.kind != Kind::Sheet && !links::is_local(&g.url)));
 
         // parse once per change of text/mode, not every frame (fetched pages can be big)
         let key = {
@@ -1398,6 +1846,7 @@ impl App {
         let mut open = true;
         let mut apply = false;
         let mut fetch = false;
+        let mut open_file = false;
         let parsed = &self.bulk_cache.as_ref().unwrap().1;
         let n = parsed.len();
         egui::Window::new(RichText::new("Paste or fetch checklist").font(bold(18.0)))
@@ -1408,6 +1857,9 @@ impl App {
             .default_pos(ctx.screen_rect().center())
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    if ui.button("Open file…").on_hover_text("Read the checklist from a saved page or text file").clicked() {
+                        open_file = true;
+                    }
                     let label = if self.bulk_fetching { "Fetching…" } else { "Fetch from guide page" };
                     if ui
                         .add_enabled(web && !self.bulk_fetching && !url.is_empty(), egui::Button::new(RichText::new(label).font(bold(16.0))))
@@ -1473,6 +1925,26 @@ impl App {
                     apply = true;
                 }
             });
+        if open_file {
+            let picked = rfd::FileDialog::new()
+                .set_title("Open a guide's text")
+                .add_filter("Saved pages and text", &["html", "htm", "txt", "md", "csv"])
+                .add_filter("All files", &["*"])
+                .pick_file();
+            if let Some(path) = picked {
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        let raw = String::from_utf8_lossy(&bytes).into_owned();
+                        let html = path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("html") || e.eq_ignore_ascii_case("htm"));
+                        if let Some((_, buf)) = &mut self.bulk {
+                            *buf = if html { online::html_to_text(&raw) } else { raw };
+                        }
+                        self.bulk_error = None;
+                    }
+                    Err(e) => self.bulk_error = Some(format!("Couldn't read {}: {e}", path.display())),
+                }
+            }
+        }
         if fetch {
             self.bulk_fetching = true;
             self.bulk_error = None;
@@ -1524,6 +1996,8 @@ impl App {
                     ui.separator();
                 };
                 heading(ui, "Look");
+                ui.checkbox(&mut self.animate, "Animated background (drifting stars)")
+                    .on_hover_text("Off: a still background, and JAGT only redraws when something changes.");
                 if ui.checkbox(&mut self.glow, "Neon glow (HDR-style bloom)").changed() {
                     set_glow(self.glow);
                 }
@@ -1635,11 +2109,30 @@ impl App {
     fn frame(&mut self, ctx: &egui::Context) {
         self.track_window(ctx);
         let now = self.time();
-        let had_input = ctx.input(|i| !i.events.is_empty() || i.pointer.any_down());
+        // Moving the mouse can't change the library, so those frames skip the (whole-library)
+        // unsaved-changes check.
+        let had_input = ctx.input(|i| {
+            i.pointer.any_down()
+                || i.pointer.any_released()
+                || i.events.iter().any(|e| !matches!(e, egui::Event::PointerMoved(_) | egui::Event::PointerGone | egui::Event::WindowFocused(_)))
+        });
         let pumped = self.pump(ctx);
         self.keyboard(ctx);
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        if !dropped.is_empty() {
+            self.add_paths(dropped);
+        }
 
-        paint_night_sky(&ctx.layer_painter(egui::LayerId::background()), ctx.screen_rect(), now);
+        let (focused, minimized) = ctx.input(|i| (i.viewport().focused.unwrap_or(true), i.viewport().minimized.unwrap_or(false)));
+        let animating = self.animate && focused && !minimized;
+        // the stars only drift while they're animating; otherwise they hold still
+        let star_time = if animating {
+            now
+        } else {
+            ctx.data(|d| d.get_temp::<f64>(egui::Id::new("star-time"))).unwrap_or(now)
+        };
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("star-time"), star_time));
+        paint_night_sky(&ctx.layer_painter(egui::LayerId::background()), ctx.screen_rect(), star_time);
 
         egui::TopBottomPanel::top("header").frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 6))).show(ctx, |ui| self.header(ui));
 
@@ -1658,7 +2151,7 @@ impl App {
         });
 
         let gid = self.selected.filter(|id| self.lib.games.iter().any(|g| g.id == *id));
-        if let Some(gid) = gid {
+        if let Some(gid) = gid.filter(|_| !self.explorer_open) {
             egui::SidePanel::right("journal").resizable(true).default_width(330.0).width_range(260.0..=520.0).frame(pad).show(ctx, |ui| {
                 contained(ui, |ui| {
                     window(ui, "Where I Left Off", |ui| self.resume_view(ui, gid));
@@ -1669,6 +2162,9 @@ impl App {
         }
 
         egui::CentralPanel::default().frame(pad).show(ctx, |ui| match gid {
+            _ if self.explorer_open => {
+                window(ui, "Explorer", |ui| self.explorer_view(ui));
+            }
             Some(gid) => {
                 window(ui, "Game", |ui| self.game_header(ui, gid));
                 ui.add_space(12.0);
@@ -1722,8 +2218,10 @@ impl App {
         self.autosave(had_input || pumped);
         self.watch_file(now);
 
-        // A slow tick keeps the stars drifting and lets the autosave timer fire.
-        ctx.request_repaint_after(std::time::Duration::from_millis(66));
+        // Redraw at ~15 fps only while the stars are drifting. Otherwise egui redraws on input, and a
+        // 1 s tick keeps autosave and the library-file check going (and status messages expiring).
+        let tick = if animating { 66 } else { 1000 };
+        ctx.request_repaint_after(std::time::Duration::from_millis(tick));
     }
 
 }
@@ -1743,6 +2241,12 @@ impl eframe::App for App {
             selected: self.selected,
             online: self.online_on,
             glow: self.glow,
+            animate: self.animate,
+            folder_view: self.folder_view,
+            closed_folders: self.closed_folders.clone(),
+            ex_layout: self.ex_layout,
+            explorer_open: self.explorer_open,
+            ex_path: self.ex_path.clone(),
             window_size: self.window_size.map(|s| [s.x, s.y]),
             maximized: self.maximized,
         };
@@ -1829,7 +2333,12 @@ fn guide_card(ui: &mut Ui, g: &mut Guide, c: &mut CardCtx) -> Vec<CardAct> {
                             ui.ctx().copy_text(g.resume_url());
                             ui.close_menu();
                         }
-                        if ui.button("Look up title again").clicked() {
+                        if links::is_local(&g.url) {
+                            if ui.button("Show in folder").clicked() {
+                                acts.push(CardAct::ShowInFolder);
+                                ui.close_menu();
+                            }
+                        } else if ui.button("Look up title again").clicked() {
                             acts.push(CardAct::Refetch);
                             ui.close_menu();
                         }
@@ -1871,7 +2380,8 @@ fn guide_card(ui: &mut Ui, g: &mut Guide, c: &mut CardCtx) -> Vec<CardAct> {
             // ---- info row
             ui.horizontal(|ui| {
                 ui.add_space(42.0);
-                let mut info = vec![g.kind.label().to_string(), links::host(&g.url)];
+                let place = if links::is_local(&g.url) { "file on this PC".to_string() } else { links::host(&g.url) };
+                let mut info = vec![g.kind.label().to_string(), place];
                 info.push(match g.last_opened {
                     Some(t) => format!("opened {}", model::ago(t)),
                     None => "not opened yet".into(),
@@ -2076,6 +2586,410 @@ fn big_checkbox(ui: &mut Ui, checked: bool) -> egui::Response {
     resp
 }
 
+/// Guide files at `p` (a file, or a folder searched recursively, in name order), up to 500.
+fn collect_guide_files(p: &std::path::Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if out.len() >= 500 || depth > 8 {
+        return;
+    }
+    if p.is_dir() {
+        let Ok(rd) = std::fs::read_dir(p) else { return };
+        let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        entries.sort_by_key(|e| e.to_string_lossy().to_lowercase());
+        for e in entries {
+            collect_guide_files(&e, out, depth + 1);
+        }
+    } else if links::is_guide_file(p) {
+        out.push(p.to_path_buf());
+    }
+}
+
+/// Opens the file manager with the file selected (Windows), or its folder.
+fn show_in_folder(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut arg = std::ffi::OsString::from("/select,\"");
+        arg.push(path.as_os_str());
+        arg.push("\"");
+        std::process::Command::new("explorer").raw_arg(arg).spawn().map(|_| ())
+    }
+    #[cfg(not(windows))]
+    {
+        open::that_detached(path.parent().unwrap_or(path))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+enum ExplorerLayout {
+    #[default]
+    Icons,
+    Details,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+enum ExplorerItem {
+    Folder(String),
+    Game(u64),
+}
+
+/// A game as the explorer shows it (owned, so drawing doesn't hold on to the library).
+struct GameTile {
+    id: u64,
+    title: String,
+    platform: String,
+    status: Status,
+    folder: Option<Folder>,
+    progress: f32,
+    last_played: Option<i64>,
+    host: String,
+}
+
+const TILE: Vec2 = Vec2::new(128.0, 150.0);
+
+/// What's inside an explorer folder: its subfolders (name, games under them) and its games.
+/// `[]` is the top (PC, Console...), `["Console"]` a folder, `["Console", "PS5"]` a platform.
+/// `None` if the path doesn't exist (any more).
+fn explorer_children(games: &[&Game], path: &[String]) -> Option<(Vec<(String, Vec<u64>)>, Vec<u64>)> {
+    match path {
+        [] => {
+            let folders = Folder::ALL
+                .iter()
+                .map(|f| (f.label().to_string(), games.iter().filter(|g| g.folder() == *f).map(|g| g.id).collect::<Vec<_>>()))
+                .filter(|(_, ids)| !ids.is_empty())
+                .collect();
+            Some((folders, Vec::new()))
+        }
+        [top, rest @ ..] => {
+            let f = Folder::ALL.into_iter().find(|f| f.label() == top)?;
+            let inside: Vec<&&Game> = games.iter().filter(|g| g.folder() == f).collect();
+            let mut platforms: Vec<String> = Vec::new();
+            for g in &inside {
+                let name = platform_name(&g.platform);
+                if !platforms.iter().any(|p| p.eq_ignore_ascii_case(&name)) {
+                    platforms.push(name);
+                }
+            }
+            platforms.sort_by_key(|p| p.to_lowercase());
+            match rest {
+                [] if platforms.len() > 1 => {
+                    let folders = platforms
+                        .iter()
+                        .map(|p| (p.clone(), inside.iter().filter(|g| platform_name(&g.platform).eq_ignore_ascii_case(p)).map(|g| g.id).collect()))
+                        .collect();
+                    Some((folders, Vec::new()))
+                }
+                [] => Some((Vec::new(), inside.iter().map(|g| g.id).collect())),
+                [pl] if platforms.len() > 1 => {
+                    let ids: Vec<u64> = inside.iter().filter(|g| platform_name(&g.platform).eq_ignore_ascii_case(pl)).map(|g| g.id).collect();
+                    (!ids.is_empty()).then_some((Vec::new(), ids))
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
+/// The colour of a platform's game cases: PlayStation blue, Nintendo red, Xbox green...
+fn platform_color(platform: &str) -> Color32 {
+    let p = platform.to_lowercase();
+    let has = |w: &[&str]| w.iter().any(|x| p.contains(x));
+    if has(&["playstation", "psp", "vita"]) || p.split(|c: char| !c.is_alphanumeric()).any(|w| w.starts_with("ps")) {
+        Color32::from_rgb(0x2F, 0x5B, 0xD8)
+    } else if has(&["switch", "nintendo", "3ds", "wii", "game boy", "gameboy", "gba", "gamecube", "n64", "snes", "nes"]) || p.split(|c: char| !c.is_alphanumeric()).any(|w| w == "ds") {
+        Color32::from_rgb(0xE6, 0x2A, 0x2A)
+    } else if has(&["xbox"]) {
+        Color32::from_rgb(0x2E, 0xA0, 0x43)
+    } else if has(&["sega", "dreamcast", "genesis", "saturn", "mega drive"]) {
+        Color32::from_rgb(0x1E, 0x88, 0xE5)
+    } else {
+        match Folder::of_platform(platform) {
+            Folder::Pc => Color32::from_rgb(0x8A, 0x8F, 0xA8),
+            Folder::Mobile => TEAL,
+            Folder::Linux => Color32::from_rgb(0xF0, 0x8A, 0x24),
+            _ => DIM,
+        }
+    }
+}
+
+/// Back / forward / up button.
+fn tool_arrow(ui: &mut Ui, dir: Vec2, enabled: bool, tip: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(28.0, 26.0), if enabled { Sense::click() } else { Sense::hover() });
+    let p = ui.painter();
+    if enabled && resp.hovered() {
+        p.rect_filled(rect, 2.0, INDIGO);
+        p.rect_stroke(rect, 2.0, Stroke::new(1.0f32, TEAL), StrokeKind::Inside);
+    }
+    icons::arrow(p, rect, dir, if !enabled { DIM.gamma_multiply(0.5) } else if resp.hovered() { TEAL } else { YELLOW });
+    resp.on_hover_text(tip)
+}
+
+/// One part of the breadcrumb path.
+fn crumb(ui: &mut Ui, text: &str, current: bool) -> egui::Response {
+    let t = RichText::new(text).color(if current { YELLOW } else { TEAL });
+    ui.add(egui::Label::new(if current { t.font(bold(16.0)) } else { t }).sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Tile background: highlighted when selected, lit on hover (like Explorer).
+fn tile_bg(p: &egui::Painter, rect: Rect, selected: bool, hovered: bool) {
+    if selected {
+        p.rect_filled(rect, 3.0, INDIGO);
+        p.rect_stroke(rect, 3.0, Stroke::new(1.5f32, YELLOW), StrokeKind::Inside);
+        glow_rect(p, rect, 3.0, YELLOW, 4.0);
+    } else if hovered {
+        p.rect_filled(rect, 3.0, white_a(14));
+        p.rect_stroke(rect, 3.0, Stroke::new(1.0f32, TEAL), StrokeKind::Inside);
+    }
+}
+
+/// A name under a tile: centred, wrapped to two lines.
+fn tile_name(p: &egui::Painter, rect: Rect, top: f32, text: &str, color: Color32) {
+    let mut job = egui::text::LayoutJob::simple(text.to_string(), bold(15.0), color, rect.width() - 10.0);
+    job.halign = Align::Center;
+    job.wrap.max_rows = 2;
+    job.wrap.break_anywhere = false;
+    let galley = p.layout_job(job);
+    p.with_clip_rect(rect).galley(Pos2::new(rect.center().x, top), galley, color);
+}
+
+fn folder_tile(ui: &mut Ui, name: &str, count: usize, peek: &[Color32], selected: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(TILE, Sense::click());
+    let p = ui.painter();
+    tile_bg(p, rect, selected, resp.hovered());
+    let icon = Rect::from_center_size(Pos2::new(rect.center().x, rect.top() + 46.0), Vec2::new(92.0, 70.0));
+    icons::folder_big(p, icon, peek);
+    tile_name(p, rect, icon.bottom() + 8.0, name, if selected { YELLOW } else { WHITE });
+    p.text(Pos2::new(rect.center().x, rect.bottom() - 6.0), Align2::CENTER_BOTTOM, if count == 1 { "1 game".to_string() } else { format!("{count} games") }, pixel(12.0), DIM);
+    resp.on_hover_text(format!("{name} ({count})\nDouble-click to open"))
+}
+
+fn game_tile(ui: &mut Ui, t: &GameTile, cover: Option<egui::TextureId>, selected: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(TILE, Sense::click());
+    let p = ui.painter();
+    tile_bg(p, rect, selected, resp.hovered());
+    let case = Rect::from_center_size(Pos2::new(rect.center().x, rect.top() + 46.0), Vec2::new(56.0, 74.0));
+    icons::game_case(p, case, platform_color(&t.platform), cover, t.status.color());
+    tile_name(p, rect, case.bottom() + 6.0, &t.title, if selected { YELLOW } else { WHITE });
+    let bar = Rect::from_min_max(Pos2::new(rect.left() + 14.0, rect.bottom() - 9.0), Pos2::new(rect.right() - 14.0, rect.bottom() - 5.0));
+    p.rect_filled(bar, 1.0, INK);
+    p.rect_filled(Rect::from_min_max(bar.min, Pos2::new(bar.left() + bar.width() * t.progress, bar.bottom())), 1.0, t.status.color());
+    resp.on_hover_text(format!("{}\n{} · {} · {:.0}%\nDouble-click to open", t.title, t.platform, t.status.label(), t.progress * 100.0))
+}
+
+const DETAIL_COLS: [(&str, f32); 5] = [("Name", 0.42), ("Platform", 0.18), ("Status", 0.13), ("Progress", 0.14), ("Last played", 0.13)];
+
+fn details_header(ui: &mut Ui, w: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 24.0), Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, 0.0, PURPLE);
+    let mut x = rect.left() + 6.0;
+    for (name, frac) in DETAIL_COLS {
+        p.text(Pos2::new(x, rect.center().y), Align2::LEFT_CENTER, name, bold(14.0), YELLOW);
+        x += frac * w;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn details_row(
+    ui: &mut Ui,
+    w: f32,
+    n: usize,
+    selected: bool,
+    case_color: Option<Color32>,
+    name: &str,
+    platform: &str,
+    status: &str,
+    progress: Option<(f32, Color32)>,
+    played: &str,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 28.0), Sense::click());
+    let p = ui.painter();
+    let bg = if selected {
+        INDIGO
+    } else if resp.hovered() {
+        HOVER_BG
+    } else if n % 2 == 1 {
+        CARD_BG
+    } else {
+        Color32::TRANSPARENT
+    };
+    p.rect_filled(rect, 0.0, bg);
+    if selected {
+        p.rect_stroke(rect.shrink(0.5), 0.0, Stroke::new(1.0f32, YELLOW), StrokeKind::Inside);
+    }
+    let cols: Vec<f32> = DETAIL_COLS.iter().scan(rect.left() + 6.0, |x, (_, f)| {
+        let at = *x;
+        *x += f * w;
+        Some(at)
+    }).collect();
+    let cell = |i: usize| Rect::from_min_max(Pos2::new(cols[i], rect.top()), Pos2::new(cols.get(i + 1).copied().unwrap_or(rect.right()) - 8.0, rect.bottom()));
+    // icon + name
+    let icon = Rect::from_center_size(Pos2::new(cols[0] + 10.0, rect.center().y), Vec2::new(18.0, 16.0));
+    match case_color {
+        Some(c) => {
+            let r = Rect::from_center_size(icon.center(), Vec2::new(12.0, 16.0));
+            p.rect_filled(r, 2.0, Color32::from_rgb(0x2B, 0x27, 0x45));
+            p.rect_filled(Rect::from_min_size(r.min, Vec2::new(r.width(), 4.0)), 1.0, c);
+            p.rect_stroke(r, 2.0, Stroke::new(1.0f32, Color32::from_gray(200)), StrokeKind::Inside);
+        }
+        None => icons::folder_icon(p, icon, false, true),
+    }
+    let name_cell = Rect::from_min_max(Pos2::new(cols[0] + 26.0, rect.top()), cell(0).max);
+    p.with_clip_rect(name_cell).text(name_cell.left_center(), Align2::LEFT_CENTER, name, bold(15.0), if selected { YELLOW } else { WHITE });
+    p.with_clip_rect(cell(1)).text(cell(1).left_center(), Align2::LEFT_CENTER, platform, pixel(14.0), TEAL);
+    p.with_clip_rect(cell(2)).text(cell(2).left_center(), Align2::LEFT_CENTER, status, pixel(14.0), DIM);
+    if let Some((f, c)) = progress {
+        let c3 = cell(3);
+        let bar = Rect::from_min_max(Pos2::new(c3.left(), c3.center().y - 3.0), Pos2::new(c3.right() - 40.0, c3.center().y + 3.0));
+        p.rect_filled(bar, 1.0, INK);
+        p.rect_filled(Rect::from_min_max(bar.min, Pos2::new(bar.left() + bar.width() * f, bar.bottom())), 1.0, c);
+        p.text(Pos2::new(c3.right(), c3.center().y), Align2::RIGHT_CENTER, format!("{:.0}%", f * 100.0), pixel(13.0), TEAL);
+    }
+    p.with_clip_rect(cell(4)).text(cell(4).left_center(), Align2::LEFT_CENTER, played, pixel(13.0), DIM);
+    resp
+}
+
+/// The right-click menu for a game (list, tree and explorer).
+fn game_menu(ui: &mut Ui, id: u64, status: Status, folder: Option<Folder>, platform: &str, acts: &mut Vec<GameAct>) {
+    if ui.button(RichText::new("Open").font(bold(15.0))).clicked() {
+        acts.push(GameAct::Select(id));
+        ui.close_menu();
+    }
+    ui.separator();
+    ui.label(RichText::new("Set status").color(TEAL));
+    for s in Status::ALL {
+        if ui.selectable_label(status == s, s.label()).clicked() {
+            acts.push(GameAct::Status(id, s));
+            ui.close_menu();
+        }
+    }
+    ui.separator();
+    ui.label(RichText::new("Move to folder").color(TEAL));
+    let auto = Folder::of_platform(platform);
+    if ui.selectable_label(folder.is_none(), format!("Automatic ({})", auto.label())).clicked() {
+        acts.push(GameAct::Folder(id, None));
+        ui.close_menu();
+    }
+    for f in Folder::ALL {
+        if ui.selectable_label(folder == Some(f), f.label()).clicked() {
+            acts.push(GameAct::Folder(id, Some(f)));
+            ui.close_menu();
+        }
+    }
+}
+
+/// The header's Explorer icon, next to the status icons.
+fn explorer_icon(ui: &mut Ui, active: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(66.0, 56.0), Sense::click());
+    let p = ui.painter();
+    if active || resp.hovered() {
+        p.rect_filled(rect, 3.0, if active { INDIGO } else { white_a(10) });
+        p.rect_stroke(rect, 3.0, Stroke::new(1.0f32, if active { YELLOW } else { TEAL }), StrokeKind::Inside);
+    }
+    let ic = Rect::from_center_size(rect.center_top() + Vec2::new(0.0, 19.0), Vec2::new(34.0, 27.0));
+    icons::folder_big(p, ic, &[Color32::from_rgb(0x2F, 0x5B, 0xD8), Color32::from_rgb(0xE6, 0x2A, 0x2A)]);
+    let fg = if active { YELLOW } else if resp.hovered() { TEAL } else { WHITE };
+    p.text(rect.center_bottom() - Vec2::new(0.0, 3.0), Align2::CENTER_BOTTOM, "Explorer", pixel(14.0), fg);
+    resp.on_hover_text("Browse your games like a file explorer: folders, large icons or details")
+}
+
+/// What a row in the games list asks for.
+enum GameAct {
+    Select(u64),
+    Status(u64, Status),
+    Folder(u64, Option<Folder>),
+}
+
+/// The platform as a subfolder name: "ps5" and "PS5 " are the same folder.
+fn platform_name(platform: &str) -> String {
+    let p = platform.trim();
+    if p.is_empty() {
+        "No platform".into()
+    } else {
+        p.to_string()
+    }
+}
+
+/// An explorer folder row: arrow, pixel folder, name and how many games are inside.
+fn folder_row(ui: &mut Ui, name: &str, count: usize, open: bool, depth: usize, width: f32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 26.0), Sense::click());
+    let p = ui.painter();
+    if resp.hovered() {
+        p.rect_filled(rect, 2.0, HOVER_BG);
+    }
+    let x = rect.left() + 6.0 + depth as f32 * 16.0;
+    let k = Pos2::new(x + 4.0, rect.center().y);
+    let tri = if open {
+        vec![k + Vec2::new(-4.0, -2.5), k + Vec2::new(4.0, -2.5), k + Vec2::new(0.0, 3.0)]
+    } else {
+        vec![k + Vec2::new(-2.5, -4.0), k + Vec2::new(3.0, 0.0), k + Vec2::new(-2.5, 4.0)]
+    };
+    p.add(egui::Shape::convex_polygon(tri, if resp.hovered() { TEAL } else { YELLOW }, Stroke::NONE));
+    let icon = Rect::from_center_size(Pos2::new(x + 22.0, rect.center().y), Vec2::new(20.0, 16.0));
+    icons::folder_icon(p, icon, open, depth == 0);
+    let col = if depth == 0 { YELLOW } else { TEAL };
+    let text_rect = Rect::from_min_max(Pos2::new(icon.right() + 7.0, rect.top()), Pos2::new(rect.right() - 30.0, rect.bottom()));
+    p.with_clip_rect(text_rect.intersect(p.clip_rect())).text(text_rect.left_center(), Align2::LEFT_CENTER, name, if depth == 0 { bold(16.0) } else { pixel(15.0) }, col);
+    p.text(Pos2::new(rect.right() - 8.0, rect.center().y), Align2::RIGHT_CENTER, count.to_string(), pixel(14.0), DIM);
+    resp.on_hover_text(if open { "Close folder" } else { "Open folder" })
+}
+
+/// A game in the list: status stripe, title, details and progress. `indent` is in tree levels.
+fn game_row(ui: &mut Ui, g: &Game, sel: bool, n: usize, indent: f32, width: f32, acts: &mut Vec<GameAct>) {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, GAME_ROW_H), Sense::click());
+    let rect = Rect::from_min_max(Pos2::new(rect.left() + indent * 16.0, rect.top()), rect.max);
+    let p = ui.painter();
+    let bg = if sel {
+        INDIGO
+    } else if resp.hovered() {
+        HOVER_BG
+    } else if n % 2 == 1 {
+        CARD_BG
+    } else {
+        Color32::TRANSPARENT
+    };
+    p.rect_filled(rect, 0.0, bg);
+    if sel {
+        p.rect_stroke(rect.shrink(0.5), 0.0, Stroke::new(1.0f32, MAGENTA), StrokeKind::Inside);
+        glow_rect(p, rect, 0.0, MAGENTA, 4.0);
+    }
+    p.rect_filled(Rect::from_min_size(rect.min, Vec2::new(4.0, rect.height())), 0.0, g.status.color());
+
+    let inner = rect.shrink2(Vec2::new(10.0, 4.0));
+    let clip = p.with_clip_rect(inner.intersect(p.clip_rect()));
+    clip.text(inner.left_top() + Vec2::new(2.0, 0.0), Align2::LEFT_TOP, &g.title, bold(16.0), if sel { YELLOW } else { WHITE });
+    let mut sub = vec![g.status.label().to_string()];
+    if !g.platform.is_empty() {
+        sub.push(g.platform.clone());
+    }
+    sub.push(match g.guides.len() {
+        1 => "1 guide".into(),
+        n => format!("{n} guides"),
+    });
+    if let Some(t) = g.last_played {
+        sub.push(model::ago(t));
+    }
+    clip.text(inner.left_top() + Vec2::new(2.0, 19.0), Align2::LEFT_TOP, sub.join(" · "), pixel(12.0), DIM);
+
+    let pr = g.progress();
+    let bar = Rect::from_min_max(Pos2::new(inner.left() + 2.0, inner.bottom() - 4.0), Pos2::new(inner.right() - 34.0, inner.bottom() - 1.0));
+    p.rect_filled(bar, 1.0, INK);
+    p.rect_filled(Rect::from_min_max(bar.min, Pos2::new(bar.left() + bar.width() * pr, bar.bottom())), 1.0, g.status.color());
+    p.text(Pos2::new(inner.right(), bar.center().y), Align2::RIGHT_CENTER, format!("{:.0}%", pr * 100.0), pixel(12.0), TEAL);
+
+    if resp.clicked() {
+        acts.push(GameAct::Select(g.id));
+    }
+    resp.context_menu(|ui| game_menu(ui, g.id, g.status, g.folder, &g.platform, acts));
+}
+
+/// Everything that decides a checklist row's height. If it's unchanged, the remembered height holds.
+fn row_fingerprint(s: &Step, state: StepState, is_next: bool, can_find: bool, width: f32) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (&s.text, &s.detail, &s.how, &s.reward, &s.deadline, s.optional, s.hidden).hash(&mut h);
+    (state as u8, is_next, can_find, width.round() as i32).hash(&mut h);
+    h.finish()
+}
+
 /// "2 chests · 1 objective" for the given items.
 fn kind_counts(steps: &[Step], idx: impl Iterator<Item = usize>) -> String {
     let mut n = [0usize; 4];
@@ -2265,7 +3179,10 @@ fn armed_button(ui: &mut Ui, key: impl Hash, label: &str, now: f64) -> bool {
 /// so the box takes exactly the space left: the row can never be wider than where it sits.
 /// Returns (text box, button clicked, Enter pressed in the box).
 fn input_row(ui: &mut Ui, buf: &mut String, hint: &str, id: impl Hash, button: &str) -> (egui::Response, bool, bool) {
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+    // exactly one row tall: a bare `with_layout` would take (and centre itself in) all the
+    // height left below it, dropping the row into the middle of the panel
+    let row = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
+    ui.allocate_ui_with_layout(row, Layout::right_to_left(Align::Center), |ui| {
         let clicked = ui.button(button).clicked();
         let r = ui.add(egui::TextEdit::singleline(buf).id_salt(id).hint_text(hint).desired_width(ui.available_width()));
         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
@@ -2402,6 +3319,165 @@ mod tests {
         }
         run(app, ctx, size, vec![button(to, false)]);
         run(app, ctx, size, vec![egui::Event::PointerGone]);
+    }
+
+    /// Frame-time benchmark on a real library. Not run by default:
+    /// `JAGT_BENCH_LIB=path/to/copy.json cargo test --release bench_frames -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_frames() {
+        let Ok(path) = std::env::var("JAGT_BENCH_LIB") else {
+            eprintln!("set JAGT_BENCH_LIB to a copy of library.json");
+            return;
+        };
+        let lib = model::read_file(std::path::Path::new(&path)).expect("library");
+        let biggest = lib.games.iter().max_by_key(|g| g.guides.iter().map(|x| x.steps.len()).sum::<usize>()).map(|g| g.id);
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let saved = Saved { online: false, selected: biggest, ..Default::default() };
+        let nowhere = std::env::temp_dir().join("jagt-bench-does-not-exist").join("library.json");
+        let mut app = App::build(&ctx, saved, lib, nowhere, false, false);
+        let size = Vec2::new(1700.0, 1000.0);
+        let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)), events, ..Default::default() };
+            let out = ctx.run(input, |ctx| app.frame(ctx));
+            let _ = ctx.tessellate(out.shapes, out.pixels_per_point);
+        };
+        for _ in 0..20 {
+            frame(&mut app, vec![]);
+        }
+        let mut time = |label: &str, app: &mut App, make: &dyn Fn(usize) -> Vec<egui::Event>| {
+            let n = 200;
+            let t = Instant::now();
+            for k in 0..n {
+                frame(app, make(k));
+            }
+            let ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+            eprintln!("BENCH {label:<28} {ms:7.2} ms/frame  ({:.0} fps)", 1000.0 / ms);
+        };
+        // where the time goes
+        {
+            let n = 100;
+            let (mut run_t, mut tess_t) = (0.0, 0.0);
+            for _ in 0..n {
+                let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)), ..Default::default() };
+                let t = Instant::now();
+                let out = ctx.run(input, |ctx| app.frame(ctx));
+                run_t += t.elapsed().as_secs_f64();
+                let t = Instant::now();
+                let _ = ctx.tessellate(out.shapes, out.pixels_per_point);
+                tess_t += t.elapsed().as_secs_f64();
+            }
+            eprintln!("BENCH   layout {:.2} ms, tessellate {:.2} ms", run_t * 1000.0 / n as f64, tess_t * 1000.0 / n as f64);
+            let t = Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(hash_lib(&app.lib));
+            }
+            eprintln!("BENCH   unsaved-changes check (hash_lib) {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+        }
+        time("idle", &mut app, &|_| vec![]);
+        time("mouse moving over list", &mut app, &|k| vec![egui::Event::PointerMoved(Pos2::new(700.0 + (k % 50) as f32 * 4.0, 750.0))]);
+        time("scrolling the checklist", &mut app, &|_| {
+            vec![
+                egui::Event::PointerMoved(Pos2::new(800.0, 800.0)),
+                egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, -40.0), modifiers: Default::default() },
+            ]
+        });
+    }
+
+    #[test]
+    fn dropping_a_folder_adds_its_guide_files() {
+        let dir = std::env::temp_dir().join(format!("jagt-drop-test-{}", std::process::id()));
+        let sub = dir.join("maps");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(dir.join("Walkthrough Part 1.pdf"), b"%PDF").unwrap();
+        std::fs::write(sub.join("World Map.png"), b"png").unwrap();
+        std::fs::write(dir.join("game.exe"), b"MZ").unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let before = app.lib.games[0].guides.len();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 850.0))),
+            dropped_files: vec![egui::DroppedFile { path: Some(dir.clone()), ..Default::default() }],
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| app.frame(ctx));
+
+        let guides = &app.lib.games[0].guides;
+        let added: Vec<(&str, Kind)> = guides[before..].iter().map(|g| (g.title.as_str(), g.kind)).collect();
+        assert_eq!(added, [("World Map", Kind::Map), ("Walkthrough Part 1", Kind::Doc)], "the .exe is skipped, subfolders are searched");
+        assert!(guides[before..].iter().all(|g| links::is_local(&g.url)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explorer_folders_and_paths() {
+        let g = |id, platform: &str| Game { id, title: format!("game {id}"), platform: platform.into(), ..Default::default() };
+        let all = [g(1, "PS5"), g(2, "PSP"), g(3, "ps5"), g(4, "PC (Steam)"), g(5, "Android")];
+        let games: Vec<&Game> = all.iter().collect();
+        let names = |v: &Vec<(String, Vec<u64>)>| v.iter().map(|(n, ids)| (n.clone(), ids.len())).collect::<Vec<_>>();
+
+        let (top, loose) = explorer_children(&games, &[]).unwrap();
+        assert_eq!(names(&top), [("PC".to_string(), 1), ("Console".into(), 3), ("Mobile".into(), 1)]);
+        assert!(loose.is_empty());
+        // Console holds two platforms ("PS5" and "ps5" are the same folder) → subfolders
+        let (sub, loose) = explorer_children(&games, &["Console".into()]).unwrap();
+        assert_eq!(names(&sub), [("PS5".to_string(), 2), ("PSP".into(), 1)]);
+        assert!(loose.is_empty());
+        assert_eq!(explorer_children(&games, &["Console".into(), "PS5".into()]).unwrap().1, vec![1, 3]);
+        // a single-platform folder lists its games directly
+        assert_eq!(explorer_children(&games, &["PC".into()]).unwrap(), (vec![], vec![4]));
+        // paths that don't exist
+        assert!(explorer_children(&games, &["Linux".into()]).is_none() || explorer_children(&games, &["Linux".into()]).unwrap().1.is_empty());
+        assert!(explorer_children(&games, &["Console".into(), "Xbox".into()]).is_none());
+        assert!(explorer_children(&games, &["Nope".into()]).is_none());
+    }
+
+    #[test]
+    fn explorer_opens_and_navigates() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let size = Vec2::new(1400.0, 850.0);
+        app.explorer_open = true;
+        for layout in [ExplorerLayout::Icons, ExplorerLayout::Details] {
+            app.ex_layout = layout;
+            for path in [vec![], vec!["Console".to_string()], vec!["PC".to_string()]] {
+                app.ex_go(path);
+                for _ in 0..3 {
+                    run(&mut app, &ctx, size, vec![]);
+                }
+            }
+        }
+        // back goes to the previous folder, a missing folder falls back to the top
+        app.ex_path = vec!["Nope".into()];
+        run(&mut app, &ctx, size, vec![]);
+        assert!(app.ex_path.is_empty());
+        // opening a game closes the explorer and selects it
+        app.ex_open_game(4);
+        assert_eq!((app.explorer_open, app.selected), (false, Some(4)));
+    }
+
+    #[test]
+    fn input_row_stays_on_its_line() {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let mut buf = String::new();
+        let mut got = None;
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 900.0))), ..Default::default() };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let top = ui.cursor().top();
+                let (r, _, _) = input_row(ui, &mut buf, "Search…", "t", "+ Add");
+                let after = ui.cursor().top();
+                ui.label("next line");
+                got = Some((top, r.rect, after));
+            });
+        });
+        let (top, rect, after) = got.unwrap();
+        assert!(rect.top() - top < 8.0, "text box at y={} instead of near the top ({top})", rect.top());
+        assert!(after - top < 40.0, "the row took {}px of height instead of one line", after - top);
+        assert!(rect.width() > 250.0, "text box only {}px wide in a 400px panel", rect.width());
     }
 
     #[test]
