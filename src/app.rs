@@ -41,6 +41,8 @@ struct Saved {
     ex_layout: ExplorerLayout,
     /// One-line checklist items.
     compact_rows: bool,
+    /// Which windows get the space.
+    view: ViewMode,
     /// Reopen the explorer where it was left.
     explorer_open: bool,
     ex_path: Vec<String>,
@@ -50,7 +52,7 @@ struct Saved {
 
 impl Default for Saved {
     fn default() -> Self {
-        Saved { filter: None, selected: None, online: true, glow: true, animate: true, folder_view: true, closed_folders: Vec::new(), ex_layout: ExplorerLayout::Icons, compact_rows: false, explorer_open: false, ex_path: Vec::new(), window_size: None, maximized: false }
+        Saved { filter: None, selected: None, online: true, glow: true, animate: true, folder_view: true, closed_folders: Vec::new(), ex_layout: ExplorerLayout::Icons, compact_rows: false, view: ViewMode::All, explorer_open: false, ex_path: Vec::new(), window_size: None, maximized: false }
     }
 }
 
@@ -65,6 +67,32 @@ struct NewGame {
     platform: String,
     status: Status,
     focus: bool,
+}
+
+/// Which of the game's windows get the space: all of them, or just one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+enum ViewMode {
+    #[default]
+    All,
+    Game,
+    Guides,
+    Checklist,
+    /// Where I Left Off + Session Log.
+    Notes,
+}
+
+impl ViewMode {
+    const ALL: [ViewMode; 5] = [ViewMode::All, ViewMode::Game, ViewMode::Guides, ViewMode::Checklist, ViewMode::Notes];
+
+    fn label(self) -> &'static str {
+        match self {
+            ViewMode::All => "All",
+            ViewMode::Game => "Game",
+            ViewMode::Guides => "Guides",
+            ViewMode::Checklist => "Checklist",
+            ViewMode::Notes => "Notes",
+        }
+    }
 }
 
 /// What a guide card asks the app to do once the list has been drawn.
@@ -109,8 +137,8 @@ pub struct App {
     closed_folders: Vec<String>,
     ex_layout: ExplorerLayout,
     compact_rows: bool,
-    /// Focus mode: the checklist gets the whole window (Game, Guides and the journal step aside).
-    focus: bool,
+    /// All windows, or just one of them using the whole space (Focus = just the Checklist).
+    view: ViewMode,
     /// Compact rows whose details are opened, by (guide, item).
     open_rows: HashSet<(u64, usize)>,
     /// The explorer window is showing (instead of the selected game).
@@ -211,7 +239,7 @@ impl App {
             closed_folders: saved.closed_folders,
             ex_layout: saved.ex_layout,
             compact_rows: saved.compact_rows,
-            focus: false,
+            view: saved.view,
             open_rows: HashSet::new(),
             explorer_open: saved.explorer_open,
             ex_path: saved.ex_path,
@@ -551,8 +579,8 @@ impl App {
                 self.undo_redo(true);
             }
         }
-        if self.focus && !typing && self.add_game.is_none() && self.bulk.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
-            self.focus = false;
+        if self.view != ViewMode::All && !typing && self.add_game.is_none() && self.bulk.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+            self.view = ViewMode::All;
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::N)) {
             self.add_game = Some(NewGame { title: String::new(), platform: String::new(), status: Status::Playing, focus: true });
@@ -591,6 +619,28 @@ impl App {
             if explorer_icon(ui, self.explorer_open).clicked() {
                 self.explorer_open = !self.explorer_open;
             }
+            ui.add_space(14.0);
+            // one compact dropdown, so the header fits on narrower windows
+            ui.label(RichText::new("Show").color(TEAL));
+            let shown = if self.explorer_open { "Explorer" } else { self.view.label() };
+            egui::ComboBox::from_id_salt("show-view")
+                .selected_text(RichText::new(shown).color(YELLOW))
+                .width(96.0)
+                .show_ui(ui, |ui| {
+                    for v in ViewMode::ALL {
+                        let tip = match v {
+                            ViewMode::All => "All windows (the usual layout)".to_string(),
+                            ViewMode::Notes => "Only Where I Left Off and the Session Log".to_string(),
+                            other => format!("Only the {} window", other.label()),
+                        };
+                        if ui.selectable_label(self.view == v && !self.explorer_open, v.label()).on_hover_text(tip).clicked() {
+                            self.view = v;
+                            self.explorer_open = false;
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Which windows get the space: all of them, or just one (Esc goes back to all)");
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(8.0);
@@ -1000,9 +1050,10 @@ impl App {
                     paste = true;
                 }
                 if has_steps {
-                    let focus_label = if self.focus { "Exit focus" } else { "Focus" };
-                    if ui.add(egui::Button::new(focus_label).selected(self.focus)).on_hover_text("Give the checklist the whole window (Esc to leave)").clicked() {
-                        self.focus = !self.focus;
+                    let focused = self.view == ViewMode::Checklist;
+                    let focus_label = if focused { "Exit focus" } else { "Focus" };
+                    if ui.add(egui::Button::new(focus_label).selected(focused)).on_hover_text("Give the checklist the whole window (Esc to leave)").clicked() {
+                        self.view = if focused { ViewMode::All } else { ViewMode::Checklist };
                     }
                     if ui
                         .add(egui::Button::new("Compact").selected(self.compact_rows))
@@ -2186,13 +2237,25 @@ impl App {
         });
 
         let gid = self.selected.filter(|id| self.lib.games.iter().any(|g| g.id == *id));
-        let focusing = self.focus && gid.is_some_and(|id| self.lib.games.iter().any(|g| g.id == id && !g.guides.is_empty()));
-        if let Some(gid) = gid.filter(|_| !self.explorer_open && !focusing) {
+        let has_guides = gid.is_some_and(|id| self.lib.games.iter().any(|g| g.id == id && !g.guides.is_empty()));
+        // the view in effect: a game's checklist needs a guide; no game means the usual layout
+        let view = match self.view {
+            ViewMode::Checklist if !has_guides => ViewMode::All,
+            v if gid.is_some() => v,
+            _ => ViewMode::All,
+        };
+        // a title-bar button clicked this frame: (which window, which button)
+        let mut win: Option<(ViewMode, WinButton)> = None;
+        if let Some(gid) = gid.filter(|_| !self.explorer_open && view == ViewMode::All) {
             egui::SidePanel::right("journal").resizable(true).default_width(330.0).width_range(260.0..=520.0).frame(pad).show(ctx, |ui| {
                 contained(ui, |ui| {
-                    window(ui, "Where I Left Off", |ui| self.resume_view(ui, gid));
+                    if let (_, Some(b)) = window_ctl(ui, "Where I Left Off", false, |ui| self.resume_view(ui, gid)) {
+                        win = Some((ViewMode::Notes, b));
+                    }
                     ui.add_space(12.0);
-                    window(ui, "Session Log", |ui| self.log_view(ui, gid));
+                    if let (_, Some(b)) = window_ctl(ui, "Session Log", false, |ui| self.log_view(ui, gid)) {
+                        win = Some((ViewMode::Notes, b));
+                    }
                 });
             });
         }
@@ -2201,20 +2264,42 @@ impl App {
             _ if self.explorer_open => {
                 window(ui, "Explorer", |ui| self.explorer_view(ui));
             }
-            Some(gid) if focusing => {
-                window(ui, "Checklist", |ui| self.checklist_view(ui, gid));
+            Some(gid) if view != ViewMode::All => {
+                // one window gets all the space
+                let (_, b) = match view {
+                    ViewMode::Game => window_ctl(ui, "Game", true, |ui| {
+                        self.game_header(ui, gid);
+                        ui.allocate_space(ui.available_size());
+                    }),
+                    ViewMode::Guides => window_ctl(ui, "Guides", true, |ui| self.guides_view(ui, gid, f32::INFINITY)),
+                    ViewMode::Checklist => window_ctl(ui, "Checklist", true, |ui| self.checklist_view(ui, gid)),
+                    _ => {
+                        let (_, a) = window_ctl(ui, "Where I Left Off", true, |ui| self.resume_view(ui, gid));
+                        ui.add_space(12.0);
+                        let (_, b) = window_ctl(ui, "Session Log", true, |ui| self.log_view(ui, gid));
+                        ((), a.or(b))
+                    }
+                };
+                if let Some(b) = b {
+                    win = Some((view, b));
+                }
             }
             Some(gid) => {
-                window(ui, "Game", |ui| self.game_header(ui, gid));
+                if let (_, Some(b)) = window_ctl(ui, "Game", false, |ui| self.game_header(ui, gid)) {
+                    win = Some((ViewMode::Game, b));
+                }
                 ui.add_space(12.0);
-                let has_guides = self.lib.games.iter().any(|g| g.id == gid && !g.guides.is_empty());
                 if has_guides {
                     let max_h = (ui.available_height() * 0.28).max(130.0);
-                    window(ui, "Guides", |ui| self.guides_view(ui, gid, max_h));
+                    if let (_, Some(b)) = window_ctl(ui, "Guides", false, |ui| self.guides_view(ui, gid, max_h)) {
+                        win = Some((ViewMode::Guides, b));
+                    }
                     ui.add_space(12.0);
-                    window(ui, "Checklist", |ui| self.checklist_view(ui, gid));
-                } else {
-                    window(ui, "Guides", |ui| self.guides_view(ui, gid, f32::INFINITY));
+                    if let (_, Some(b)) = window_ctl(ui, "Checklist", false, |ui| self.checklist_view(ui, gid)) {
+                        win = Some((ViewMode::Checklist, b));
+                    }
+                } else if let (_, Some(b)) = window_ctl(ui, "Guides", false, |ui| self.guides_view(ui, gid, f32::INFINITY)) {
+                    win = Some((ViewMode::Guides, b));
                 }
             }
             None => {
@@ -2240,6 +2325,12 @@ impl App {
                 });
             }
         });
+        match win {
+            // □ on a window: show only it; □ (restore) or × on a lone window: back to all
+            Some((w, WinButton::Maximize)) => self.view = if view == ViewMode::All { w } else { ViewMode::All },
+            Some((_, WinButton::Close)) => self.view = ViewMode::All,
+            None => {}
+        }
 
         if let Some((msg, until)) = &self.status {
             if now < *until {
@@ -2285,6 +2376,7 @@ impl eframe::App for App {
             closed_folders: self.closed_folders.clone(),
             ex_layout: self.ex_layout,
             compact_rows: self.compact_rows,
+            view: self.view,
             explorer_open: self.explorer_open,
             ex_path: self.ex_path.clone(),
             window_size: self.window_size.map(|s| [s.x, s.y]),
@@ -3565,11 +3657,76 @@ mod tests {
         app.open_rows.insert((2, 0));
         let opened = checklist_height(&mut app, &ctx);
         assert!(opened > short + 20.0, "opened row {opened}px vs closed {short}px");
-        // focus mode draws only the checklist, and Esc leaves it
-        app.focus = true;
-        run(&mut app, &ctx, size, vec![]);
+        // every single-window view draws (Focus = the Checklist view), and Esc goes back to all
+        for v in ViewMode::ALL {
+            app.view = v;
+            for _ in 0..2 {
+                run(&mut app, &ctx, size, vec![]);
+            }
+        }
+        app.view = ViewMode::Checklist;
         run(&mut app, &ctx, size, vec![egui::Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }]);
-        assert!(!app.focus);
+        assert_eq!(app.view, ViewMode::All);
+    }
+
+    /// The □ in a window's title bar: where it is in the drawn frame (found by its 12×12 box on the
+    /// same line as the window's title).
+    fn maximize_button(ctx: &egui::Context, app: &mut App, size: Vec2, title: &str) -> Pos2 {
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)), ..Default::default() };
+        let out = ctx.run(input, |ctx| app.frame(ctx));
+        // the same word can appear elsewhere (the header's Show buttons): the window title is the
+        // one with the three 12×12 title-bar boxes on its line
+        let boxes_on = |y: f32| {
+            let mut boxes: Vec<Rect> = out
+                .shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::Shape::Rect(r) if (r.rect.width() - 12.0).abs() < 0.5 && (r.rect.height() - 12.0).abs() < 0.5 && (r.rect.center().y - y).abs() < 4.0 => Some(r.rect),
+                    _ => None,
+                })
+                .collect();
+            boxes.sort_by(|a, b| b.center().x.total_cmp(&a.center().x));
+            boxes.dedup_by(|a, b| (a.center().x - b.center().x).abs() < 1.0);
+            boxes
+        };
+        let boxes = out
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == title => Some(boxes_on(t.pos.y + t.galley.size().y / 2.0)),
+                _ => None,
+            })
+            .find(|b| b.len() >= 3)
+            .expect("window title with its title-bar buttons");
+        // right to left: ×, □, _
+        boxes[1].center()
+    }
+
+    #[test]
+    fn title_bar_maximize_and_restore() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let size = Vec2::new(1400.0, 850.0);
+        for _ in 0..3 {
+            run(&mut app, &ctx, size, vec![]);
+        }
+        let click = |app: &mut App, at: Pos2| {
+            let b = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+            run(app, &ctx, size, vec![egui::Event::PointerMoved(at)]);
+            run(app, &ctx, size, vec![b(true)]);
+            run(app, &ctx, size, vec![b(false)]);
+            run(app, &ctx, size, vec![egui::Event::PointerGone]);
+        };
+        let at = maximize_button(&ctx, &mut app, size, "Checklist");
+        click(&mut app, at);
+        assert_eq!(app.view, ViewMode::Checklist, "□ on the Checklist shows only the Checklist");
+        let at = maximize_button(&ctx, &mut app, size, "Checklist");
+        click(&mut app, at);
+        assert_eq!(app.view, ViewMode::All, "the restore button goes back to all windows");
+        // the journal's windows maximise to the Notes view
+        let at = maximize_button(&ctx, &mut app, size, "Session Log");
+        click(&mut app, at);
+        assert_eq!(app.view, ViewMode::Notes);
     }
 
     #[test]

@@ -48,6 +48,9 @@ If you paste a link that already has `&t=95s` or `#range=A40` in it, JAGT keeps 
   - **What's left**: what's still to do, area by area. Click an item to tick it, or "Show these" to
     open the list at that area.
   - **Find in guide** opens the guide page scrolled to that item.
+  - **Show** (in the header) picks which windows get the space: **All** (the usual layout), or just
+    the **Game**, **Guides**, **Checklist** or **Notes** (Where I Left Off + Session Log). The □ button
+    on any window's title bar does the same for that window, and turns into a restore button.
   - **Focus** gives the checklist the whole window (Esc to leave). **Compact** shows one line per
     item: click its arrow, or hover it, for the details.
   - Guides whose checklist isn't the one on show fold to one line, with a **Checklist x/y**

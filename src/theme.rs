@@ -222,10 +222,17 @@ pub fn paint_night_sky(painter: &egui::Painter, rect: Rect, time: f64) {
 // Site-style window
 
 /// Draws the little "_ □ x" buttons the site's title bars have.
-fn title_buttons(painter: &egui::Painter, right: f32, cy: f32) {
+/// The three title-bar buttons, right to left: close, maximise, minimise.
+fn title_button_rect(right: f32, cy: f32, i: usize) -> Rect {
+    Rect::from_center_size(Pos2::new(right - 10.0 - i as f32 * 16.0, cy), Vec2::splat(12.0))
+}
+
+/// Draws the little "_ □ x" buttons the site's title bars have. When `maximized`, the middle one
+/// shows the "restore" icon (two overlapping squares), like Windows.
+fn title_buttons(painter: &egui::Painter, right: f32, cy: f32, maximized: bool) {
     let fg = YELLOW;
     for i in 0..3 {
-        let r = Rect::from_center_size(Pos2::new(right - 10.0 - i as f32 * 16.0, cy), Vec2::splat(12.0));
+        let r = title_button_rect(right, cy, i);
         painter.rect_filled(r, 1.0, INK);
         painter.rect_stroke(r, 1.0, Stroke::new(1.0f32, fg), StrokeKind::Inside);
         let c = r.center();
@@ -233,6 +240,11 @@ fn title_buttons(painter: &egui::Painter, right: f32, cy: f32) {
             0 => {
                 painter.line_segment([c + Vec2::new(-3.0, -3.0), c + Vec2::new(3.0, 3.0)], Stroke::new(1.5f32, fg));
                 painter.line_segment([c + Vec2::new(3.0, -3.0), c + Vec2::new(-3.0, 3.0)], Stroke::new(1.5f32, fg));
+            }
+            1 if maximized => {
+                painter.rect_stroke(Rect::from_center_size(c + Vec2::new(1.5, -1.5), Vec2::splat(5.0)), 0.0, Stroke::new(1.0f32, fg), StrokeKind::Inside);
+                painter.rect_filled(Rect::from_center_size(c + Vec2::new(-1.0, 1.0), Vec2::splat(5.0)), 0.0, INK);
+                painter.rect_stroke(Rect::from_center_size(c + Vec2::new(-1.0, 1.0), Vec2::splat(5.0)), 0.0, Stroke::new(1.0f32, fg), StrokeKind::Inside);
             }
             1 => {
                 painter.rect_stroke(Rect::from_center_size(c, Vec2::splat(6.0)), 0.0, Stroke::new(1.0f32, fg), StrokeKind::Inside);
@@ -246,8 +258,26 @@ fn title_buttons(painter: &egui::Painter, right: f32, cy: f32) {
 
 /// A window in the site's style: yellow border, purple chrome, title bar, dark content well.
 /// Lights up (indigo body, teal title) on hover like the site does.
+/// A title-bar button that was clicked (see `window_ctl`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WinButton {
+    Maximize,
+    Close,
+}
+
 pub fn window<R>(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    window_impl(ui, title, None, add_contents).0
+}
+
+/// A window whose title-bar □ and × buttons work: returns which one was clicked.
+/// `maximized` swaps □ for the "restore" icon.
+pub fn window_ctl<R>(ui: &mut Ui, title: &str, maximized: bool, add_contents: impl FnOnce(&mut Ui) -> R) -> (R, Option<WinButton>) {
+    window_impl(ui, title, Some(maximized), add_contents)
+}
+
+fn window_impl<R>(ui: &mut Ui, title: &str, controls: Option<bool>, add_contents: impl FnOnce(&mut Ui) -> R) -> (R, Option<WinButton>) {
     let id = ui.id().with(("site-window", title));
+    let mut clicked = None;
     let hovered = ui
         .ctx()
         .data(|d| d.get_temp::<Rect>(id))
@@ -279,7 +309,26 @@ pub fn window<R>(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui) ->
                 bold(16.0),
                 title_fg,
             );
-            title_buttons(p, bar.right() - 2.0, bar.center().y);
+            title_buttons(p, bar.right() - 2.0, bar.center().y, controls == Some(true));
+            if let Some(maximized) = controls {
+                let buttons = [
+                    (0, WinButton::Close, if maximized { "Back to all windows" } else { "Close (only while one window fills the space)" }),
+                    (1, WinButton::Maximize, if maximized { "Back to all windows" } else { "Show only this window" }),
+                ];
+                for (i, which, tip) in buttons {
+                    if which == WinButton::Close && !maximized {
+                        continue; // closing only means something in a single-window view
+                    }
+                    let r = title_button_rect(bar.right() - 2.0, bar.center().y, i);
+                    let resp = ui.interact(r.expand(2.0), id.with(("title-button", i)), egui::Sense::click());
+                    if resp.hovered() {
+                        ui.painter().rect_stroke(r.expand(1.0), 1.0, Stroke::new(2.0f32, TEAL), StrokeKind::Outside);
+                    }
+                    if resp.on_hover_text(tip).clicked() {
+                        clicked = Some(which);
+                    }
+                }
+            }
             ui.add_space(2.0);
             egui::Frame::new()
                 .fill(INK)
@@ -293,7 +342,7 @@ pub fn window<R>(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui) ->
         });
     glow_rect(ui.painter(), resp.response.rect, 4.0, if hovered { TEAL } else { YELLOW }, 7.0);
     ui.ctx().data_mut(|d| d.insert_temp(id, resp.response.rect));
-    resp.inner
+    (resp.inner, clicked)
 }
 
 // ---------------------------------------------------------------------------------------------
