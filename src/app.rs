@@ -543,6 +543,9 @@ impl App {
         if h == self.saved_hash {
             return;
         }
+        if let Err(e) = model::daily_backup(&self.lib_path) {
+            self.set_status_for(format!("Couldn't make today's backup: {e}"), 6.0);
+        }
         match model::save(&self.lib_path, &self.lib) {
             Ok(()) => {
                 self.saved_hash = h;
@@ -2106,6 +2109,36 @@ impl App {
                         .small()
                         .color(DIM),
                 );
+                let backups = model::list_backups(&self.lib_path);
+                ui.label(RichText::new(format!("Daily backups (last {} days)", model::BACKUP_DAYS)).color(TEAL));
+                if backups.is_empty() {
+                    ui.label(RichText::new("The first one is made with today's first save.").small().color(DIM));
+                }
+                let now = self.time();
+                let mut restore = None;
+                egui::ScrollArea::vertical().id_salt("backups").max_height(120.0).show(ui, |ui| {
+                    for (path, date) in &backups {
+                        ui.horizontal(|ui| {
+                            let games = model::read_file(path).map(|l| l.games.len()).unwrap_or(0);
+                            ui.label(RichText::new(format!("{date}  ·  {games} games")).small().color(YELLOW));
+                            if armed_button(ui, ("restore", date.as_str()), "Restore", now) {
+                                restore = Some((path.clone(), date.clone()));
+                            }
+                        });
+                    }
+                });
+                if let Some((path, date)) = restore {
+                    match model::read_file(&path) {
+                        Ok(lib) => {
+                            self.lib = lib;
+                            if self.selected.is_some_and(|id| !self.lib.games.iter().any(|g| g.id == id)) {
+                                self.selected = self.sorted_ids().first().copied();
+                            }
+                            self.set_status(format!("Restored the {date} backup (Undo brings back what you had)"));
+                        }
+                        Err(e) => self.set_status_for(format!("Couldn't read that backup: {e}"), 6.0),
+                    }
+                }
                 ui.horizontal(|ui| {
                     if ui.button("Open data folder").clicked() {
                         if let Some(dir) = self.lib_path.parent() {

@@ -556,6 +556,51 @@ pub fn save(path: &Path, lib: &Library) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// How many daily backups to keep.
+pub const BACKUP_DAYS: usize = 14;
+
+fn backup_dir(library: &Path) -> PathBuf {
+    library.parent().unwrap_or(Path::new(".")).join("backups")
+}
+
+/// Before the first save of each day, copies the library to `backups/library-YYYY-MM-DD.json`,
+/// keeping the newest `BACKUP_DAYS`.
+pub fn daily_backup(library: &Path) -> std::io::Result<()> {
+    if !library.exists() {
+        return Ok(());
+    }
+    let dir = backup_dir(library);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let file = dir.join(format!("library-{today}.json"));
+    if !file.exists() {
+        std::fs::create_dir_all(&dir)?;
+        std::fs::copy(library, &file)?;
+    }
+    let mut all = list_backups(library);
+    while all.len() > BACKUP_DAYS {
+        if let Some((oldest, _)) = all.pop() {
+            let _ = std::fs::remove_file(oldest);
+        }
+    }
+    Ok(())
+}
+
+/// Daily backups, newest first: (file, "2026-11-15").
+pub fn list_backups(library: &Path) -> Vec<(PathBuf, String)> {
+    let Ok(rd) = std::fs::read_dir(backup_dir(library)) else { return Vec::new() };
+    let mut out: Vec<(PathBuf, String)> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter_map(|p| {
+            let name = p.file_name()?.to_str()?.to_string();
+            let date = name.strip_prefix("library-")?.strip_suffix(".json")?.to_string();
+            Some((p, date))
+        })
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out
+}
+
 pub fn ago(ts: i64) -> String {
     let d = now() - ts;
     if d < 60 {
@@ -595,6 +640,25 @@ mod tests {
 
     fn st(text: &str, optional: bool, deadline: &str) -> Step {
         Step { text: text.into(), optional, deadline: deadline.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn daily_backups_rotate() {
+        let dir = std::env::temp_dir().join(format!("jagt-backup-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("backups")).unwrap();
+        let lib = dir.join("library.json");
+        std::fs::write(&lib, "{}").unwrap();
+        // 20 old backups: rotation keeps the newest 14, including today's
+        for d in 1..=20 {
+            std::fs::write(dir.join("backups").join(format!("library-2020-01-{d:02}.json")), "{}").unwrap();
+        }
+        daily_backup(&lib).unwrap();
+        let all = list_backups(&lib);
+        assert_eq!(all.len(), BACKUP_DAYS);
+        assert_eq!(all[0].1, chrono::Local::now().format("%Y-%m-%d").to_string(), "today's backup is newest");
+        assert_eq!(all.last().unwrap().1, "2020-01-08", "the oldest were removed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
