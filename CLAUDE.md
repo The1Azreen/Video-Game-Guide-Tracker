@@ -24,8 +24,16 @@ Rust + egui 0.31 desktop app. UI in `src/app.rs`, data model in `src/model.rs`, 
   into the fingerprint.
 - Idle redraws: ~15 fps only while the stars animate (focused window, animation on); otherwise 1 s.
 - The unsaved-changes check serialises the whole library; it only runs on frames with real input.
+  So big things stay out of `library.json`: guide text for the reader lives in `jagt-data/pages/<guide>.txt`.
+- The reader (`reader_view`) lays out only the lines on screen, using estimated heights corrected as
+  lines are drawn. `find_line` matches items to lines (normalised quotes/spaces, area heading first);
+  check it on real pages with `JAGT_PAGE="a.txt;b.txt" cargo test reader_finds_items -- --ignored --nocapture`.
 - Benchmark on a copy of a real library:
   `JAGT_BENCH_LIB=path/to/copy.json cargo test --release bench_frames -- --ignored --nocapture`
+
+Hotkeys (`hotkeys.rs`, `global-hotkey`, Windows only) are registered in `App::new`, never in tests.
+The mini window is an immediate viewport; in tests (no backend) it draws as an embedded window.
+Play sessions stop in `on_exit`; one left by a crash is dropped on startup if over 12 h old.
 
 `cargo test` includes `app::tests::side_panels_stay_where_you_put_them`, which drives the real UI headless:
 it drags both panel edges, resizes the window, and fails if a panel moves on its own or if anything in a

@@ -27,6 +27,10 @@ pub struct Achievement {
     pub name: String,
     pub description: String,
     pub achieved: bool,
+    /// Share of players who have it, in percent (when the platform says).
+    pub rarity: Option<f32>,
+    /// The platform's internal name (Steam's "apiname"), to match global percentages.
+    pub id: String,
 }
 
 /// For matching names across sites: lower case, letters and digits only.
@@ -111,7 +115,15 @@ pub fn steam_achievements(agent: &ureq::Agent, api_key: &str, steam_id: &str, ap
         enc(steam_id)
     );
     match get_json(agent, &url, None) {
-        Ok(v) => parse_steam(&v),
+        Ok(v) => {
+            let mut list = parse_steam(&v)?;
+            // how rare each one is: public, no key needed; skipped quietly if it fails
+            let url = format!("https://api.steampowered.com/ISteamUserStats/GetGlobalAchievementPercentagesForApp/v0002/?gameid={app_id}&format=json");
+            if let Ok(p) = get_json(agent, &url, None) {
+                apply_percentages(&mut list, &p);
+            }
+            Ok(list)
+        }
         Err(ureq::Error::Status(400, _)) => Err("Steam has no achievements for that game on your account (check the app ID, and that you own it).".into()),
         Err(e) => Err(steam_error(e)),
     }
@@ -129,9 +141,23 @@ fn parse_steam(v: &Value) -> Result<Vec<Achievement>, String> {
             name: a["name"].as_str().or(a["apiname"].as_str()).unwrap_or("").to_string(),
             description: a["description"].as_str().unwrap_or("").to_string(),
             achieved: a["achieved"].as_i64() == Some(1),
+            rarity: None,
+            id: a["apiname"].as_str().unwrap_or("").to_string(),
         })
         .filter(|a| !a.name.is_empty())
         .collect())
+}
+
+/// Fills in `rarity` from GetGlobalAchievementPercentagesForApp (percent comes as a number or a
+/// string, depending on the day).
+fn apply_percentages(list: &mut [Achievement], v: &Value) {
+    let Some(all) = v["achievementpercentages"]["achievements"].as_array() else { return };
+    for p in all {
+        let (Some(name), Some(pct)) = (p["name"].as_str(), p["percent"].as_f64().or_else(|| p["percent"].as_str()?.parse().ok())) else { continue };
+        if let Some(a) = list.iter_mut().find(|a| a.id == name) {
+            a.rarity = Some(pct as f32);
+        }
+    }
 }
 
 fn steam_error(e: ureq::Error) -> String {
@@ -213,6 +239,8 @@ fn parse_xbox(v: &Value) -> Vec<Achievement> {
                         name: x["name"].as_str()?.to_string(),
                         description: x["description"].as_str().or(x["lockedDescription"].as_str()).unwrap_or("").to_string(),
                         achieved: x["progressState"].as_str() == Some("Achieved"),
+                        rarity: x["rarity"]["currentPercentage"].as_f64().map(|p| p as f32),
+                        id: x["id"].as_str().unwrap_or("").to_string(),
                     })
                 })
                 .collect()
@@ -232,10 +260,15 @@ mod tests {
             {"apiname": "ACH_2", "achieved": 0, "unlocktime": 0, "name": "Our Song", "description": ""}
         ]}});
         let a = parse_steam(&v).unwrap();
+        let mut a = a;
         assert_eq!(a, vec![
-            Achievement { name: "The Body".into(), description: "Reach the end.".into(), achieved: true },
-            Achievement { name: "Our Song".into(), description: "".into(), achieved: false },
+            Achievement { name: "The Body".into(), description: "Reach the end.".into(), achieved: true, rarity: None, id: "ACH_1".into() },
+            Achievement { name: "Our Song".into(), description: "".into(), achieved: false, rarity: None, id: "ACH_2".into() },
         ]);
+        let pct = json!({"achievementpercentages": {"achievements": [{"name": "ACH_2", "percent": "3.4"}, {"name": "ACH_1", "percent": 61.5}]}});
+        apply_percentages(&mut a, &pct);
+        assert_eq!(a[0].rarity, Some(61.5));
+        assert_eq!(a[1].rarity, Some(3.4));
         let err = json!({"playerstats": {"error": "Profile is not public", "success": false}});
         assert_eq!(parse_steam(&err).unwrap_err(), "Profile is not public");
         assert!(parse_steam(&json!({"playerstats": {"success": true}})).is_err(), "no achievements");
@@ -248,13 +281,14 @@ mod tests {
         let titles = json!({"titles": [{"titleId": "1234", "name": "Metaphor: ReFantazio"}, {"titleId": 999, "name": "Forza Horizon 5"}]});
         assert_eq!(parse_titles(&titles), vec![("1234".to_string(), "Metaphor: ReFantazio".to_string()), ("999".to_string(), "Forza Horizon 5".to_string())]);
         let ach = json!({"achievements": [
-            {"name": "Shake on It", "description": "Unlock a follower.", "progressState": "Achieved"},
+            {"name": "Shake on It", "description": "Unlock a follower.", "progressState": "Achieved", "rarity": {"currentCategory": "Rare", "currentPercentage": 4.5}},
             {"name": "Bookworm", "lockedDescription": "Read every book.", "progressState": "NotStarted"}
         ]});
         let a = parse_xbox(&ach);
         assert_eq!(a.len(), 2);
         assert!(a[0].achieved && !a[1].achieved);
         assert_eq!(a[1].description, "Read every book.");
+        assert_eq!((a[0].rarity, a[1].rarity), (Some(4.5), None));
     }
 
     #[test]

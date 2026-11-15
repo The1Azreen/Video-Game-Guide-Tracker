@@ -22,6 +22,8 @@ pub enum Job {
     FindGame { game: u64, source: Source, key: String, title: String },
     /// Pull your achievements for a game.
     Sync { game: u64, source: Source, key: String, user: String, id: String },
+    /// Is this guide's page still there?
+    CheckLink { game: u64, guide: u64, url: String },
 }
 
 pub enum Done {
@@ -33,6 +35,8 @@ pub enum Done {
     Account { source: Source, result: Result<(String, String), String> },
     FoundGame { game: u64, source: Source, result: Result<(String, String), String> },
     Achievements { game: u64, source: Source, result: Result<Vec<Achievement>, String> },
+    /// Some(true) = gone, Some(false) = fine, None = couldn't tell (blocked, timed out...).
+    Link { game: u64, guide: u64, dead: Option<bool> },
 }
 
 pub struct Online {
@@ -84,6 +88,7 @@ impl Online {
                             Source::Xbox => accounts::xbox_achievements(&agent, &key, &id),
                         },
                     },
+                    Job::CheckLink { game, guide, url } => Done::Link { game, guide, dead: check_link(&agent, &url) },
                 };
                 if done.send(result).is_err() {
                     break;
@@ -97,6 +102,36 @@ impl Online {
     pub fn send(&self, job: Job) {
         let _ = self.tx.send(job);
     }
+}
+
+/// Asks for the page (HEAD, then GET for sites that refuse HEAD) and says whether it's gone.
+fn check_link(agent: &ureq::Agent, url: &str) -> Option<bool> {
+    let r = match agent.head(url).call() {
+        Err(ureq::Error::Status(400 | 403 | 405 | 501, _)) => agent.get(url).call(),
+        other => other,
+    };
+    match r {
+        Ok(_) => link_verdict(None, false),
+        Err(ureq::Error::Status(code, _)) => link_verdict(Some(code), false),
+        Err(ureq::Error::Transport(t)) => link_verdict(None, t.kind() == ureq::ErrorKind::Dns),
+    }
+}
+
+/// A page is gone if the site says so (404 / 410) or the site's name no longer exists. Sites that
+/// block automated visits (403, 429) or are having a bad day (5xx) aren't counted as gone.
+fn link_verdict(status: Option<u16>, no_such_host: bool) -> Option<bool> {
+    match status {
+        _ if no_such_host => Some(true),
+        Some(404 | 410) => Some(true),
+        Some(c) if c < 400 => Some(false),
+        Some(_) => None,
+        None => Some(false),
+    }
+}
+
+/// The Wayback Machine's latest copy of a page.
+pub fn archive_url(url: &str) -> String {
+    format!("https://web.archive.org/web/2/{url}")
 }
 
 pub fn cache_dir() -> PathBuf {
@@ -472,5 +507,20 @@ mod tests {
         let html = r#"<html><head><TITLE> Elden Ring &amp; DLC  Guide &#8211; Part 1 </TITLE><meta property="og:title" content="Elden Ring Walkthrough"></head>"#;
         assert_eq!(meta_content(html, "og:title").as_deref(), Some("Elden Ring Walkthrough"));
         assert_eq!(clean(&decode_entities(&title_tag(html).unwrap())), "Elden Ring & DLC Guide \u{2013} Part 1");
+    }
+}
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn dead_link_verdicts() {
+        assert_eq!(link_verdict(Some(404), false), Some(true));
+        assert_eq!(link_verdict(Some(410), false), Some(true));
+        assert_eq!(link_verdict(None, true), Some(true), "the site's name doesn't exist any more");
+        assert_eq!(link_verdict(Some(200), false), Some(false));
+        assert_eq!(link_verdict(Some(403), false), None, "blocked isn't gone");
+        assert_eq!(link_verdict(Some(503), false), None);
+        assert_eq!(archive_url("https://a.b/c"), "https://web.archive.org/web/2/https://a.b/c");
     }
 }

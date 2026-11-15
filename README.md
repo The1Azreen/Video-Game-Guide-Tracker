@@ -85,6 +85,29 @@ If you paste a link that already has `&t=95s` or `#range=A40` in it, JAGT keeps 
   public trophy API: paste your trophy list into **Tick from a list** instead.
 - **Box art** is looked up on Wikipedia and cached; right-click a game's cover to choose an image
   or turn it off.
+- **Mini window** (the **Mini** button on the taskbar, or <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>M</kbd>):
+  a small always-on-top window with your next item. <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Space</kbd>
+  ticks it and <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Backspace</kbd> unticks it again, even while the
+  game has the focus (Windows).
+- **Runs**: the game's **Run** menu starts a new run (New Game+, a second route). The current run is
+  filed away with its ticks and play time, and you choose what stays ticked (trophies you've earned,
+  by default). Switch back to an earlier run any time.
+- **Play time**: Continue (or **Start playing**) starts a timer, which shows on the taskbar. Stopping it,
+  or closing JAGT, logs the session. The game shows its total time and, once there's some progress,
+  roughly how long the rest should take at your pace.
+- **Guide text**: the **Guide text** button shows the guide itself beside the checklist, scrolled to
+  the item you're on and following you as you tick. It uses the text from Paste/Fetch checklist (or
+  fetches the page), and saved pages and text files are read straight from disk. Search it as well.
+- **Spoiler guard** (Checklist ▸ … ): items after your next one are covered until you click them.
+- **Missables**: the header icon lists everything you could still miss across your games: items
+  due soon (by in-game date), items with a deadline, and items a guide calls missable.
+- **Notes and images on items**: right-click an item to add a note or attach a screenshot or map.
+- **Rarity**: synced Steam and Xbox achievements show the share of players who have them, and the
+  Trophies dashboard lists what's left easiest first.
+- **Dead links**: **Settings ▸ Check every guide link** (or a guide's … menu) finds pages that have
+  gone, and gives them an **Archived copy** button (the Wayback Machine).
+- **Tags**: label games ("100%", "co-op") in the Game window; tags filter the games list and Find
+  searches them.
 - **Light on your PC**: off-screen checklist items aren't redrawn, and while JAGT isn't the active
   window the stars stop and it redraws about once a second. **Settings ▸ Animated background**
   turns the drifting stars off entirely.
@@ -96,6 +119,8 @@ Everything is saved automatically to `library.json`:
 - Windows: `%APPDATA%\JAGT\library.json`
 - Built and run from this repo (`cargo run`): `jagt-data/library.json` in the repo, which is gitignored
 - Portable mode: put a `jagt-data` folder next to the `.exe` (or put "portable" in the exe's name)
+
+Guide text kept for the reader is in `pages/` next to it, one file per guide.
 
 The previous version is kept as `library.bak.json`, and the first save each day also goes to
 `backups/library-YYYY-MM-DD.json` (the last 14 days are kept; **Settings ▸ Your data** restores one). Settings also has **Export** and **Import**,

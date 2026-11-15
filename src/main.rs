@@ -5,6 +5,7 @@
 mod accounts;
 mod app;
 mod checklist;
+mod hotkeys;
 mod icons;
 mod links;
 mod model;

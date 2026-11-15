@@ -191,6 +191,15 @@ pub struct Step {
     /// The page this item is on, when a guide spans several pages (one per chapter / week).
     /// Empty = the guide's own link.
     pub url: String,
+    /// Your own note on this item ("came back for this after chapter 5").
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub note: String,
+    /// A screenshot or map attached to this item (an image file on this PC).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub image: String,
+    /// Achievements: the share of players who have it (from Steam / Xbox), in percent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rarity: Option<f32>,
 }
 
 /// "9/25" → (9, 25). In-game calendars (Fire Emblem, Persona...) are month/day.
@@ -239,6 +248,11 @@ impl Step {
     pub fn is_open(&self, today: Option<(u32, u32)>) -> bool {
         matches!(self.state(today), StepState::Open | StepState::DueSoon)
     }
+
+    /// Can be missed: it has a deadline, or the guide calls it missable.
+    pub fn is_missable(&self) -> bool {
+        !self.deadline.is_empty() || [&self.text, &self.detail, &self.how].iter().any(|t| t.to_lowercase().contains("missable"))
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -267,6 +281,9 @@ pub struct Guide {
     pub auto_title: bool,
     /// For multi-page guides: the page Resume opens (the one the next item is on).
     pub resume_page: String,
+    /// The last link check found the page gone (404, or the site no longer exists).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dead: bool,
 }
 
 impl Guide {
@@ -406,6 +423,63 @@ pub struct Game {
     /// For achievement sync: the game's Steam app id and Xbox title id (found automatically or typed).
     pub steam_app: String,
     pub xbox_title: String,
+    /// Your own labels ("100% run", "co-op"...).
+    pub tags: Vec<String>,
+    /// Time played, in seconds, over every run (not counting a session that's still running).
+    pub play_secs: u64,
+    /// When the session that's running started.
+    pub session_start: Option<i64>,
+    /// Earlier playthroughs (New Game+ etc.), oldest first.
+    pub runs: Vec<Run>,
+    /// The current playthrough's name; empty = "Run 1" (or the next number).
+    pub run_name: String,
+    /// Cover the names and details of story items you haven't reached.
+    pub spoiler_guard: bool,
+}
+
+/// A finished (or set aside) playthrough: which items were ticked in each guide.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Run {
+    pub name: String,
+    /// When it was set aside.
+    pub ended: i64,
+    /// Time played in this run.
+    pub play_secs: u64,
+    pub guides: Vec<RunGuide>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RunGuide {
+    pub guide: u64,
+    /// Indexes of the items that were ticked / marked missed.
+    pub done: Vec<u32>,
+    pub missed: Vec<u32>,
+}
+
+impl Run {
+    /// (ticked, items) over every guide with a checklist.
+    pub fn counts(&self, game: &Game) -> (usize, usize) {
+        let total = self.guides.iter().filter_map(|rg| game.guides.iter().find(|g| g.id == rg.guide)).map(|g| g.steps.len()).sum();
+        (self.guides.iter().map(|g| g.done.len()).sum(), total)
+    }
+}
+
+/// "1 h 20 min", "45 min", "under a minute".
+pub fn fmt_duration(secs: u64) -> String {
+    let (h, m) = (secs / 3600, secs % 3600 / 60);
+    match (h, m) {
+        (0, 0) => "under a minute".into(),
+        (0, m) => format!("{m} min"),
+        (h, 0) => format!("{h} h"),
+        (h, m) => format!("{h} h {m} min"),
+    }
+}
+
+/// "1:02:03" for a running timer.
+pub fn fmt_clock(secs: u64) -> String {
+    format!("{}:{:02}:{:02}", secs / 3600, secs % 3600 / 60, secs % 60)
 }
 
 impl Game {
@@ -455,6 +529,137 @@ impl Game {
     pub fn touch(&mut self) {
         self.last_played = Some(now());
     }
+
+    /// Time played, including a session that's running (as of `at`).
+    pub fn played(&self, at: i64) -> u64 {
+        self.play_secs + self.session_start.map_or(0, |s| (at - s).max(0) as u64)
+    }
+
+    /// Starts the play timer (if it isn't running).
+    pub fn start_session(&mut self, at: i64) {
+        if self.session_start.is_none() {
+            self.session_start = Some(at);
+        }
+        self.last_played = Some(at);
+    }
+
+    /// Stops the play timer. Returns how long the session was.
+    pub fn stop_session(&mut self, at: i64) -> Option<u64> {
+        let start = self.session_start.take()?;
+        let secs = (at - start).max(0) as u64;
+        self.play_secs += secs;
+        self.last_played = Some(at);
+        Some(secs)
+    }
+
+    /// Time played in the current run.
+    pub fn run_played(&self, at: i64) -> u64 {
+        self.played(at).saturating_sub(self.runs.iter().map(|r| r.play_secs).sum())
+    }
+
+    /// How long the rest should take at your pace so far in this run: time played x what's left /
+    /// what's done. Needs half an hour of play and some progress to go on.
+    pub fn estimate_left(&self, at: i64) -> Option<u64> {
+        let played = self.run_played(at);
+        let p = self.progress();
+        if played < 1800 || !(0.03..0.995).contains(&p) || self.status == Status::Completed {
+            return None;
+        }
+        Some((played as f64 * (1.0 - p as f64) / p as f64) as u64)
+    }
+
+    /// The current run's name.
+    pub fn run_label(&self) -> String {
+        if self.run_name.trim().is_empty() {
+            format!("Run {}", self.runs.len() + 1)
+        } else {
+            self.run_name.trim().to_string()
+        }
+    }
+
+    /// Snapshot of the current run's ticks.
+    fn snapshot_run(&self, at: i64) -> Run {
+        Run {
+            name: self.run_label(),
+            ended: at,
+            play_secs: self.run_played(at),
+            guides: self
+                .guides
+                .iter()
+                .filter(|g| !g.steps.is_empty())
+                .map(|g| RunGuide {
+                    guide: g.id,
+                    done: g.steps.iter().enumerate().filter(|(_, s)| s.done).map(|(i, _)| i as u32).collect(),
+                    missed: g.steps.iter().enumerate().filter(|(_, s)| s.missed).map(|(i, _)| i as u32).collect(),
+                })
+                .collect(),
+        }
+    }
+
+    /// New Game+ (or a fresh start): files the current run away, then unticks every guide except
+    /// the ones in `keep`. With `keep_achievements`, achievement items stay ticked everywhere
+    /// (trophies you've earned stay earned).
+    pub fn new_run(&mut self, name: &str, keep: &[u64], keep_achievements: bool, at: i64) {
+        let snap = self.snapshot_run(at);
+        self.runs.push(snap);
+        self.run_name = name.trim().to_string();
+        let today = self.today();
+        for g in &mut self.guides {
+            if keep.contains(&g.id) {
+                continue;
+            }
+            for s in &mut g.steps {
+                if keep_achievements && s.kind == StepKind::Achievement {
+                    continue;
+                }
+                s.done = false;
+                s.missed = false;
+            }
+            g.done = false;
+            g.follow_checklist(today);
+        }
+    }
+
+    /// Goes back to an earlier run: the current one is filed away in its place.
+    pub fn switch_run(&mut self, i: usize, at: i64) {
+        if i >= self.runs.len() {
+            return;
+        }
+        // (the current run's time is what's played beyond every filed run, the old one included)
+        let current = self.snapshot_run(at);
+        let old = self.runs.remove(i);
+        let today = self.today();
+        for g in &mut self.guides {
+            let Some(rg) = old.guides.iter().find(|r| r.guide == g.id) else { continue };
+            for (j, s) in g.steps.iter_mut().enumerate() {
+                s.done = rg.done.contains(&(j as u32));
+                s.missed = rg.missed.contains(&(j as u32));
+            }
+            g.follow_checklist(today);
+        }
+        self.run_name = old.name;
+        self.runs.insert(i, current);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Guide text for the reader, kept beside the library (not in it: pages can be big).
+
+pub fn page_path(dir: &Path, guide: u64) -> PathBuf {
+    dir.join(format!("{guide}.txt"))
+}
+
+pub fn load_page(dir: &Path, guide: u64) -> Option<String> {
+    std::fs::read_to_string(page_path(dir, guide)).ok().filter(|t| !t.trim().is_empty())
+}
+
+pub fn save_page(dir: &Path, guide: u64, text: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(page_path(dir, guide), text)
+}
+
+pub fn pages_dir() -> PathBuf {
+    data_dir().join("pages")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -728,6 +933,79 @@ mod tests {
         assert_eq!(g.folder(), Console);
         g.folder = Some(Pc);
         assert_eq!(g.folder(), Pc);
+    }
+
+    fn game_with(steps: usize) -> Game {
+        let mut g = Game { id: 1, ..Default::default() };
+        let mut a = Guide { id: 10, ..Default::default() };
+        let mut t = Guide { id: 11, ..Default::default() };
+        for i in 0..steps {
+            a.steps.push(Step::task(format!("chapter {i}")));
+            t.steps.push(Step { kind: StepKind::Achievement, ..Step::task(format!("trophy {i}")) });
+        }
+        g.guides = vec![a, t];
+        g
+    }
+
+    #[test]
+    fn new_game_plus_and_back() {
+        let mut g = game_with(4);
+        g.guides[0].steps[0].done = true;
+        g.guides[0].steps[1].done = true;
+        g.guides[0].steps[3].missed = true;
+        g.guides[1].steps[2].done = true;
+        g.play_secs = 3600;
+        // NG+: the walkthrough resets, achievements stay earned
+        g.new_run("NG+", &[], true, 100);
+        assert_eq!(g.runs.len(), 1);
+        assert_eq!(g.runs[0].name, "Run 1");
+        assert_eq!(g.runs[0].play_secs, 3600);
+        assert_eq!(g.runs[0].counts(&g), (3, 8));
+        assert!(g.guides[0].steps.iter().all(|s| !s.done && !s.missed));
+        assert!(g.guides[1].steps[2].done, "achievements kept");
+        assert_eq!(g.run_label(), "NG+");
+        assert_eq!(g.run_played(100), 0);
+        g.play_secs += 600;
+        g.guides[0].steps[2].done = true;
+        // back to run 1: its ticks return, NG+ is filed away with its own time
+        g.switch_run(0, 200);
+        assert_eq!(g.run_label(), "Run 1");
+        assert!(g.guides[0].steps[0].done && g.guides[0].steps[1].done && !g.guides[0].steps[2].done && g.guides[0].steps[3].missed);
+        assert_eq!(g.runs[0].name, "NG+");
+        assert_eq!(g.runs[0].play_secs, 600);
+        assert_eq!(g.run_played(200), 3600);
+        // a guide you choose to keep isn't unticked
+        g.new_run("Run 3", &[10], false, 300);
+        assert!(g.guides[0].steps[0].done);
+        assert!(!g.guides[1].steps[2].done);
+    }
+
+    #[test]
+    fn play_time_and_estimate() {
+        let mut g = game_with(10);
+        g.start_session(1000);
+        g.start_session(2000); // already running: keeps the first start
+        assert_eq!(g.played(1600), 600);
+        assert_eq!(g.stop_session(4600), Some(3600));
+        assert_eq!(g.stop_session(5000), None);
+        assert_eq!(g.play_secs, 3600);
+        assert_eq!(g.estimate_left(5000), None, "no progress yet");
+        // 1 h for a quarter of it: about 3 h to go
+        for i in 0..5 {
+            g.guides[0].steps[i].done = true;
+        }
+        assert_eq!(g.progress(), 0.25);
+        assert_eq!(g.estimate_left(5000), Some(3 * 3600));
+        assert_eq!(fmt_duration(4980), "1 h 23 min");
+        assert_eq!(fmt_duration(30), "under a minute");
+        assert_eq!(fmt_clock(3723), "1:02:03");
+    }
+
+    #[test]
+    fn missable_items() {
+        assert!(st("quest", true, "9/25").is_missable());
+        assert!(Step { detail: "Missable! Talk to her before the bridge.".into(), ..Step::task("Letter") }.is_missable());
+        assert!(!Step::task("Chapter 1").is_missable());
     }
 
     #[test]

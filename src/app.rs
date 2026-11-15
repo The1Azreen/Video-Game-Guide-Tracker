@@ -9,6 +9,7 @@ use crate::icons;
 use crate::links;
 use crate::accounts::{self, Source};
 use crate::checklist;
+use crate::hotkeys::{self, HotAction, Hotkeys};
 use crate::model::{self, Folder, Game, Guide, Kind, Library, LogEntry, Status, Step, StepKind, StepState};
 use crate::online::{self, Done, Job, Online};
 use crate::theme::*;
@@ -56,11 +57,17 @@ struct Saved {
     ex_path: Vec<String>,
     window_size: Option<[f32; 2]>,
     maximized: bool,
+    /// The small always-on-top "next item" window.
+    mini_open: bool,
+    /// Games list: only games with this tag.
+    tag_filter: Option<String>,
+    /// The guide's text beside the checklist.
+    reader_open: bool,
 }
 
 impl Default for Saved {
     fn default() -> Self {
-        Saved { filter: None, selected: None, online: true, glow: true, animate: true, folder_view: true, closed_folders: Vec::new(), ex_layout: ExplorerLayout::Icons, compact_rows: false, view: ViewMode::All, steam_key: String::new(), steam_profile: String::new(), steam_id: String::new(), steam_name: String::new(), xbox_key: String::new(), xbox_tag: String::new(), explorer_open: false, ex_path: Vec::new(), window_size: None, maximized: false }
+        Saved { filter: None, selected: None, online: true, glow: true, animate: true, folder_view: true, closed_folders: Vec::new(), ex_layout: ExplorerLayout::Icons, compact_rows: false, view: ViewMode::All, steam_key: String::new(), steam_profile: String::new(), steam_id: String::new(), steam_name: String::new(), xbox_key: String::new(), xbox_tag: String::new(), explorer_open: false, ex_path: Vec::new(), window_size: None, maximized: false, mini_open: false, tag_filter: None, reader_open: false }
     }
 }
 
@@ -113,6 +120,9 @@ enum CardAct {
     BulkSteps,
     ShowChecklist,
     ShowInFolder,
+    /// Open the Wayback Machine's copy of a page that's gone.
+    Archive,
+    CheckLink,
 }
 
 /// What a checklist row asks for.
@@ -130,6 +140,28 @@ enum RowAct {
     Delete,
     Up,
     Down,
+    /// Show a spoiler-guarded item.
+    Reveal,
+    /// Edit the item's note.
+    Note,
+    /// Attach / remove / open the item's image.
+    Image,
+    NoImage,
+    OpenImage,
+}
+
+/// How a checklist row is drawn.
+#[derive(Clone, Copy)]
+struct RowLook {
+    state: StepState,
+    is_next: bool,
+    can_find: bool,
+    compact: bool,
+    open: bool,
+    cursor: bool,
+    /// Spoiler guard: the name and details are covered.
+    veiled: bool,
+    thumb: Option<(egui::TextureId, Vec2)>,
 }
 
 pub struct App {
@@ -225,6 +257,59 @@ pub struct App {
     restore_window: Option<(Option<[f32; 2]>, bool)>,
     restore_wait: u32,
     persist: bool,
+
+    /// The mini "next item" window is open.
+    mini_open: bool,
+    /// System-wide hotkeys (None in tests, or if Windows refused them).
+    hotkeys: Option<Hotkeys>,
+    /// What the hotkey ticked, newest last, for its undo: (game, guide, item).
+    hotkey_ticks: Vec<(u64, u64, usize)>,
+    tag_filter: Option<String>,
+    new_tag: String,
+    /// "New run" window: (game, name, guides to keep ticked, keep achievements).
+    run_window: Option<(u64, String, HashSet<u64>, bool)>,
+    /// The Missables dashboard is showing.
+    missables_open: bool,
+    /// Missables: include finished / dropped games.
+    missables_all: bool,
+    /// Spoiler-guarded items shown anyway, by (guide, item).
+    revealed: HashSet<(u64, usize)>,
+    /// Editing an item's note: (guide, item, text).
+    note_edit: Option<(u64, usize, String)>,
+    /// Item images, by file path.
+    thumbs: HashMap<String, Fav>,
+    /// The guide's text is shown beside the checklist.
+    reader_open: bool,
+    reader: Option<Reader>,
+    /// Waiting for this guide's page text, for the reader.
+    reader_fetching: Option<u64>,
+    reader_find: String,
+    /// Where guide texts are kept (jagt-data/pages).
+    pages_dir: PathBuf,
+    /// Link checks still running.
+    link_checks: usize,
+    link_gone: usize,
+    /// Scroll the checklist to this item on the next frame: (guide, item).
+    scroll_to_item: Option<(u64, usize)>,
+}
+
+/// The reader: a guide's text, split into lines, with remembered heights so only what's on
+/// screen is laid out.
+struct Reader {
+    guide: u64,
+    lines: Vec<String>,
+    /// Laid-out height of each line at `width` (an estimate until it has been drawn).
+    heights: Vec<f32>,
+    width: f32,
+    /// The line the current item is on, and what it was worked out for.
+    target: Option<usize>,
+    target_key: String,
+    /// Scroll to this line on the next frame.
+    jump: Option<usize>,
+    /// Search matches and the one on show.
+    found: Vec<usize>,
+    found_at: usize,
+    found_for: String,
 }
 
 fn hash_lib(lib: &Library) -> u64 {
@@ -244,6 +329,7 @@ impl App {
         let lib_path = model::library_path();
         let (lib, problem) = model::load(&lib_path);
         let mut app = Self::build(&cc.egui_ctx, saved, lib, lib_path, !opts.fresh, opts.open_settings);
+        app.hotkeys = Hotkeys::new(cc.egui_ctx.clone());
         if let Some(msg) = problem {
             app.set_status_for(msg, 12.0);
         }
@@ -327,7 +413,36 @@ impl App {
             restore_window: Some((saved.window_size, saved.maximized)),
             restore_wait: 0,
             persist,
+            mini_open: saved.mini_open,
+            hotkeys: None,
+            hotkey_ticks: Vec::new(),
+            tag_filter: saved.tag_filter,
+            new_tag: String::new(),
+            run_window: None,
+            missables_open: false,
+            missables_all: false,
+            revealed: HashSet::new(),
+            note_edit: None,
+            thumbs: HashMap::new(),
+            reader_open: saved.reader_open,
+            reader: None,
+            reader_fetching: None,
+            reader_find: String::new(),
+            pages_dir: if persist { model::pages_dir() } else { std::env::temp_dir().join(format!("jagt-test-pages-{}", std::process::id())) },
+            link_checks: 0,
+            link_gone: 0,
+            scroll_to_item: None,
         };
+        // A session left running by a crash: keep it if it's plausible, else drop it.
+        let at = model::now();
+        for g in &mut app.lib.games {
+            if g.session_start.is_some_and(|s| at - s > 12 * 3600) {
+                g.session_start = None;
+            }
+        }
+        if app.tag_filter.as_ref().is_some_and(|t| !app.lib.games.iter().any(|g| g.tags.contains(t))) {
+            app.tag_filter = None;
+        }
         app.file_mtime = mtime(&app.lib_path);
         app.snapshot = app.lib.clone();
         if app.selected.is_none_or(|id| !app.lib.games.iter().any(|g| g.id == id)) {
@@ -361,7 +476,8 @@ impl App {
             .games
             .iter()
             .filter(|g| self.filter.is_none_or(|f| g.status == f))
-            .filter(|g| q.is_empty() || g.title.to_lowercase().contains(&q) || g.platform.to_lowercase().contains(&q))
+            .filter(|g| self.tag_filter.as_ref().is_none_or(|t| g.tags.contains(t)))
+            .filter(|g| q.is_empty() || g.title.to_lowercase().contains(&q) || g.platform.to_lowercase().contains(&q) || g.tags.iter().any(|t| t.to_lowercase().contains(&q)))
             .collect();
         // A fixed order (status, then title) so rows never shuffle while you use them.
         v.sort_by(|a, b| a.status.rank().cmp(&b.status.rank()).then(a.title.to_lowercase().cmp(&b.title.to_lowercase())).then(a.id.cmp(&b.id)));
@@ -478,9 +594,144 @@ impl App {
         let Some(game) = self.game() else { return };
         let (gid, guide) = (game.id, game.continue_guide().map(|g| g.id));
         match guide {
-            Some(id) => self.open_guide(gid, id),
+            Some(id) => {
+                self.open_guide(gid, id);
+                self.start_playing(gid);
+            }
             None => self.set_status("Add a guide to this game first"),
         }
+    }
+
+    /// Starts this game's play timer, stopping any other game's.
+    fn start_playing(&mut self, gid: u64) {
+        let at = model::now();
+        let others: Vec<u64> = self.lib.games.iter().filter(|g| g.id != gid && g.session_start.is_some()).map(|g| g.id).collect();
+        for o in others {
+            self.stop_playing(o);
+        }
+        if let Some(g) = self.lib.game_mut(gid) {
+            g.start_session(at);
+        }
+    }
+
+    /// Stops a game's play timer and logs the session.
+    fn stop_playing(&mut self, gid: u64) {
+        let Some(g) = self.lib.game_mut(gid) else { return };
+        if let Some(secs) = g.stop_session(model::now()) {
+            if secs >= 60 {
+                g.log.push(LogEntry { at: model::now(), text: format!("Played {}", model::fmt_duration(secs)) });
+            }
+            let msg = format!("Stopped the timer: {} this session", model::fmt_duration(secs));
+            self.set_status(msg);
+        }
+    }
+
+    /// The game whose timer is running.
+    fn playing(&self) -> Option<&Game> {
+        self.lib.games.iter().find(|g| g.session_start.is_some())
+    }
+
+    /// The guide the mini window and the hotkeys work on: the checklist on show for the selected
+    /// game, else the one Continue would open.
+    fn current_list(&self) -> Option<(u64, u64)> {
+        let g = self.game()?;
+        let on_show = self.active_list.filter(|id| g.guides.iter().any(|x| x.id == *id && !x.steps.is_empty()));
+        let id = on_show
+            .or_else(|| g.continue_guide().filter(|x| !x.steps.is_empty()).map(|x| x.id))
+            .or_else(|| g.guides.iter().find(|x| !x.steps.is_empty()).map(|x| x.id))?;
+        Some((g.id, id))
+    }
+
+    /// Ticks the next item of the current checklist. Returns what was ticked.
+    fn tick_next(&mut self) -> Option<String> {
+        let (gid, lid) = self.current_list()?;
+        let game = self.lib.game_mut(gid)?;
+        let today = game.today();
+        let guide = game.guides.iter_mut().find(|g| g.id == lid)?;
+        let i = guide.next_index(today)?;
+        guide.steps[i].done = true;
+        guide.steps[i].missed = false;
+        let text = guide.steps[i].text.clone();
+        guide.follow_checklist(today);
+        game.last_guide = Some(lid);
+        game.touch();
+        self.hotkey_ticks.push((gid, lid, i));
+        self.set_status(format!("Ticked {text}"));
+        Some(text)
+    }
+
+    /// Unticks what `tick_next` last ticked.
+    fn untick_last(&mut self) {
+        let Some((gid, lid, i)) = self.hotkey_ticks.pop() else {
+            self.set_status("Nothing to untick");
+            return;
+        };
+        let Some(game) = self.lib.game_mut(gid) else { return };
+        let today = game.today();
+        let Some(guide) = game.guides.iter_mut().find(|g| g.id == lid) else { return };
+        if let Some(s) = guide.steps.get_mut(i) {
+            s.done = false;
+            let text = s.text.clone();
+            guide.follow_checklist(today);
+            self.set_status(format!("Unticked {text}"));
+        }
+    }
+
+    /// Opens a game (and a guide's checklist, at an item) from a dashboard or search.
+    fn go_to(&mut self, game: u64, guide: Option<u64>, item: Option<usize>, search: String) {
+        self.selected = Some(game);
+        self.explorer_open = false;
+        self.trophies_open = false;
+        self.missables_open = false;
+        if matches!(self.view, ViewMode::Game | ViewMode::Guides | ViewMode::Notes) {
+            self.view = ViewMode::All;
+        }
+        if let Some(gid) = guide {
+            self.active_list = Some(gid);
+            self.left_view = false;
+            self.list_section = None;
+            self.list_kind = None;
+            self.list_scope = None;
+            self.hide_done = false;
+            self.list_search = search;
+            self.list_cursor = item.map(|i| (gid, i));
+            if let Some(i) = item {
+                // make sure its area is open, and the reader follows it
+                let sec = self.lib.games.iter().flat_map(|g| &g.guides).find(|g| g.id == gid).and_then(|g| g.steps.get(i)).map(|s| s.section.clone());
+                if let Some(sec) = sec {
+                    self.collapsed.remove(&(gid, sec));
+                }
+                self.scroll_to_item = Some((gid, i));
+            }
+        }
+    }
+
+    /// Checks whether guide pages still exist (all games, or one).
+    fn check_links(&mut self, game: Option<u64>) {
+        if !self.online_on {
+            self.set_status("Turn Online on to check links");
+            return;
+        }
+        let mut n = 0;
+        let mut jobs = Vec::new();
+        for g in self.lib.games.iter_mut().filter(|g| game.is_none_or(|id| g.id == id)) {
+            for gd in &mut g.guides {
+                if let Some(path) = links::local_path(&gd.url) {
+                    gd.dead = !path.exists();
+                    continue;
+                }
+                if gd.url.starts_with("http") {
+                    jobs.push(Job::CheckLink { game: g.id, guide: gd.id, url: gd.url.clone() });
+                    n += 1;
+                }
+            }
+        }
+        for j in jobs {
+            self.online.send(j);
+        }
+        self.link_checks += n;
+        self.link_gone = 0;
+        self.set_status(format!("Checking {n} links\u{2026}"));
     }
 
     fn pump(&mut self, ctx: &egui::Context) -> bool {
@@ -544,8 +795,21 @@ impl App {
                     self.set_status(self.sync_note.clone());
                 }
                 Done::PageText { guide, text } => {
-                    // only if the paste window is still open for that guide
-                    if let Some((gid, buf)) = &mut self.bulk {
+                    if self.reader_fetching == Some(guide) {
+                        // for the reader: keep it beside the library
+                        self.reader_fetching = None;
+                        match text {
+                            Ok(t) => {
+                                match model::save_page(&self.pages_dir, guide, &t) {
+                                    Ok(()) => self.set_status("Got the guide's text"),
+                                    Err(e) => self.set_status_for(format!("Couldn't save the guide's text: {e}"), 6.0),
+                                }
+                                self.reader = None;
+                            }
+                            Err(e) => self.set_status_for(e, 8.0),
+                        }
+                    } else if let Some((gid, buf)) = &mut self.bulk {
+                        // only if the paste window is still open for that guide
                         if *gid == guide {
                             self.bulk_fetching = false;
                             match text {
@@ -556,6 +820,25 @@ impl App {
                                 Err(e) => self.bulk_error = Some(e),
                             }
                         }
+                    }
+                }
+                Done::Link { game, guide, dead } => {
+                    self.link_checks = self.link_checks.saturating_sub(1);
+                    if let Some(g) = self.lib.game_mut(game).and_then(|g| g.guides.iter_mut().find(|x| x.id == guide)) {
+                        if let Some(d) = dead {
+                            g.dead = d;
+                        }
+                        if g.dead {
+                            self.link_gone += 1;
+                        }
+                    }
+                    if self.link_checks == 0 {
+                        let msg = match self.link_gone {
+                            0 => "Link check done: every page is still there".to_string(),
+                            1 => "Link check done: 1 page is gone (it has an Archived copy button)".to_string(),
+                            n => format!("Link check done: {n} pages are gone (they have Archived copy buttons)"),
+                        };
+                        self.set_status_for(msg, 6.0);
                     }
                 }
             }
@@ -732,10 +1015,17 @@ impl App {
             if explorer_icon(ui, self.explorer_open).clicked() {
                 self.explorer_open = !self.explorer_open;
                 self.trophies_open = false;
+                self.missables_open = false;
             }
             if trophies_icon(ui, self.trophies_open).clicked() {
                 self.trophies_open = !self.trophies_open;
                 self.explorer_open = false;
+                self.missables_open = false;
+            }
+            if missables_icon(ui, self.missables_open).clicked() {
+                self.missables_open = !self.missables_open;
+                self.explorer_open = false;
+                self.trophies_open = false;
             }
             ui.add_space(14.0);
             // one compact dropdown, so the header fits on narrower windows
@@ -755,6 +1045,7 @@ impl App {
                             self.view = v;
                             self.explorer_open = false;
                             self.trophies_open = false;
+                            self.missables_open = false;
                         }
                     }
                 })
@@ -825,6 +1116,27 @@ impl App {
                 self.folder_view = false;
             }
         });
+        // your own tags, as filters
+        let mut tags: Vec<String> = Vec::new();
+        for g in &self.lib.games {
+            for t in &g.tags {
+                if !tags.contains(t) {
+                    tags.push(t.clone());
+                }
+            }
+        }
+        if !tags.is_empty() {
+            tags.sort_by_key(|t| t.to_lowercase());
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for t in &tags {
+                    let on = self.tag_filter.as_ref() == Some(t);
+                    if ui.selectable_label(on, RichText::new(format!("#{t}")).small()).on_hover_text("Only games with this tag (click again for all)").clicked() {
+                        self.tag_filter = if on { None } else { Some(t.clone()) };
+                    }
+                }
+            });
+        }
         let ids = self.sorted_ids();
         if ids.is_empty() {
             ui.add_space(20.0);
@@ -1026,6 +1338,13 @@ impl App {
             ui.painter().rect_stroke(bar.expand(1.0), 2.0, Stroke::new(1.0f32, INDIGO), StrokeKind::Outside);
             ui.painter().rect_filled(Rect::from_min_max(bar.min, Pos2::new(bar.left() + bar.width() * pr, bar.bottom())), 2.0, MAGENTA);
             let mut info = vec![format!("{:.0}% across guides", pr * 100.0)];
+            let at = model::now();
+            if g.played(at) >= 60 {
+                info.push(format!("played {}", model::fmt_duration(g.played(at))));
+            }
+            if let Some(left) = g.estimate_left(at) {
+                info.push(format!("~{} left at your pace", model::fmt_duration(left)));
+            }
             info.push(format!("added {}", model::date(g.added)));
             info.push(match g.last_played {
                 Some(t) => format!("last played {}", model::ago(t)),
@@ -1033,6 +1352,130 @@ impl App {
             });
             ui.label(RichText::new(info.join(" · ")).small().color(DIM));
         });
+        // ---- play timer, run, tags
+        let mut timer: Option<bool> = None;
+        let mut new_run = false;
+        let mut switch_run: Option<usize> = None;
+        let mut delete_run: Option<usize> = None;
+        let all_tags: Vec<String> = {
+            let mut v: Vec<String> = Vec::new();
+            for t in self.lib.games.iter().flat_map(|x| &x.tags) {
+                if !v.contains(t) {
+                    v.push(t.clone());
+                }
+            }
+            v
+        };
+        let new_tag = &mut self.new_tag;
+        let Some(g) = self.lib.game_mut(gid) else { return };
+        ui.horizontal_wrapped(|ui| {
+            let at = model::now();
+            match g.session_start {
+                Some(s) => {
+                    let label = format!("\u{25a0} Stop  {}", model::fmt_clock((at - s).max(0) as u64));
+                    if ui.add(egui::Button::new(RichText::new(label).color(MAGENTA)).selected(true)).on_hover_text("Stop the play timer (the session goes in the log)").clicked() {
+                        timer = Some(false);
+                    }
+                }
+                None => {
+                    if ui.button("\u{25b6} Start playing").on_hover_text("Start the play timer (Continue starts it too)").clicked() {
+                        timer = Some(true);
+                    }
+                }
+            }
+            ui.add_space(8.0);
+            ui.label(RichText::new("Run").color(TEAL));
+            ui.menu_button(RichText::new(g.run_label()).color(YELLOW), |ui| {
+                ui.label(RichText::new("Each run keeps its own ticks (New Game+, a second route...)").small().color(DIM));
+                if ui.button("Start a new run\u{2026}").clicked() {
+                    new_run = true;
+                    ui.close_menu();
+                }
+                ui.label(RichText::new("Rename this run").small().color(TEAL));
+                let hint = g.run_label();
+                ui.add(egui::TextEdit::singleline(&mut g.run_name).hint_text(hint).desired_width(180.0));
+                if !g.runs.is_empty() {
+                    ui.separator();
+                    ui.label(RichText::new("Earlier runs").small().color(TEAL));
+                    let rows: Vec<(String, String)> = g
+                        .runs
+                        .iter()
+                        .map(|r| {
+                            let (d, n) = r.counts(g);
+                            (r.name.clone(), format!("{d}/{n} ticked \u{b7} {} \u{b7} {}", model::fmt_duration(r.play_secs), model::date(r.ended)))
+                        })
+                        .collect();
+                    for (i, (name, info)) in rows.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(name).color(WHITE));
+                            ui.label(RichText::new(info).small().color(DIM));
+                            if ui.small_button("Switch to it").on_hover_text("Bring back this run's ticks (the current run is kept too)").clicked() {
+                                switch_run = Some(i);
+                                ui.close_menu();
+                            }
+                            if ui.small_button("Delete").clicked() {
+                                delete_run = Some(i);
+                                ui.close_menu();
+                            }
+                        });
+                    }
+                }
+            });
+            ui.add_space(8.0);
+            ui.label(RichText::new("Tags").color(TEAL));
+            let mut remove = None;
+            for (i, t) in g.tags.iter().enumerate() {
+                if ui.small_button(format!("#{t}  \u{d7}")).on_hover_text("Remove this tag").clicked() {
+                    remove = Some(i);
+                }
+            }
+            if let Some(i) = remove {
+                g.tags.remove(i);
+            }
+            let r = ui.add(egui::TextEdit::singleline(new_tag).id_salt(("new-tag", gid)).hint_text("+ tag").desired_width(80.0));
+            if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                let t = new_tag.trim().trim_start_matches('#').trim().to_string();
+                if !t.is_empty() && !g.tags.contains(&t) {
+                    g.tags.push(t);
+                }
+                new_tag.clear();
+            }
+            let others: Vec<&String> = all_tags.iter().filter(|t| !g.tags.contains(t)).collect();
+            if !others.is_empty() {
+                ui.menu_button("\u{25be}", |ui| {
+                    for t in others {
+                        if ui.button(format!("#{t}")).clicked() {
+                            g.tags.push(t.clone());
+                            ui.close_menu();
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Add a tag you've used before");
+            }
+        });
+        if let Some(i) = delete_run {
+            g.runs.remove(i);
+        }
+        let mut switched = None;
+        if let Some(i) = switch_run {
+            g.switch_run(i, model::now());
+            switched = Some(format!("Switched to {}", g.run_label()));
+        }
+        if new_run {
+            // keep trophy lists ticked by default
+            let keep: HashSet<u64> = g.guides.iter().filter(|x| x.kind == Kind::Trophy).map(|x| x.id).collect();
+            self.run_window = Some((gid, format!("Run {} (NG+)", g.runs.len() + 2), keep, true));
+        }
+        if let Some(m) = switched {
+            self.set_status(m);
+        }
+        match timer {
+            Some(true) => self.start_playing(gid),
+            Some(false) => self.stop_playing(gid),
+            None => {}
+        }
+        let Some(g) = self.lib.game_mut(gid) else { return };
         if let Some(c) = cover_change {
             g.cover = c;
             self.covers.remove(&gid);
@@ -1152,6 +1595,23 @@ impl App {
                     self.active_list = Some(id);
                 }
                 CardAct::ShowChecklist => self.active_list = Some(id),
+                CardAct::Archive => {
+                    let url = online::archive_url(&game.guides[i].url);
+                    if let Err(e) = open::that_detached(&url) {
+                        self.set_status_for(format!("Couldn't open the browser: {e}"), 6.0);
+                    }
+                }
+                CardAct::CheckLink => {
+                    if self.online_on {
+                        let url = game.guides[i].url.clone();
+                        self.online.send(Job::CheckLink { game: gid, guide: id, url });
+                        self.link_checks += 1;
+                        self.link_gone = 0;
+                        self.set_status("Checking the link\u{2026}");
+                    } else {
+                        self.set_status("Turn Online on to check links");
+                    }
+                }
                 CardAct::ShowInFolder => {
                     if let Some(path) = links::local_path(&game.guides[i].url) {
                         if let Err(e) = show_in_folder(&path) {
@@ -1182,6 +1642,8 @@ impl App {
         let Some(aid) = active else { return };
         let choices: Vec<(u64, String, usize)> = game.guides.iter().map(|g| (g.id, g.title.clone(), g.steps.len())).collect();
         let has_steps = choices.iter().any(|c| c.0 == aid && c.2 > 0);
+        let guard = game.spoiler_guard;
+        let mut toggle_guard = false;
 
         // ---- toolbar: which guide, view switch and actions
         let mut paste = false;
@@ -1212,6 +1674,15 @@ impl App {
                         tick_list = true;
                         ui.close_menu();
                     }
+                    let mut g = guard;
+                    if ui
+                        .checkbox(&mut g, "Spoiler guard")
+                        .on_hover_text("Cover the names and details of items after your next one, until you click them (this game)")
+                        .changed()
+                    {
+                        toggle_guard = true;
+                        ui.close_menu();
+                    }
                     if ui.button("Untick everything").clicked() {
                         untick = true;
                         ui.close_menu();
@@ -1225,6 +1696,13 @@ impl App {
                     paste = true;
                 }
                 if has_steps {
+                    if ui
+                        .add(egui::Button::new("Guide text").selected(self.reader_open))
+                        .on_hover_text("Read the guide here, beside the checklist, following your place")
+                        .clicked()
+                    {
+                        self.reader_open = !self.reader_open;
+                    }
                     let focused = self.view == ViewMode::Checklist;
                     let focus_label = if focused { "Exit focus" } else { "Focus" };
                     if ui.add(egui::Button::new(focus_label).selected(focused)).on_hover_text("Give the checklist the whole window (Esc to leave)").clicked() {
@@ -1253,8 +1731,13 @@ impl App {
             self.tick_list = Some((aid, String::new(), TickMode::Named));
         }
         let compact = self.compact_rows;
-        let App { lib, list_kind, list_scope, hide_done, list_search, list_section, left_view, collapsed, scroll_to_next, step_bufs, row_heights, open_rows, list_cursor, .. } = self;
+        let ctx = ui.ctx().clone();
+        let App { lib, list_kind, list_scope, hide_done, list_search, list_section, left_view, collapsed, scroll_to_next, step_bufs, row_heights, open_rows, list_cursor, revealed, thumbs, scroll_to_item, note_edit, .. } = self;
         let Some(game) = lib.game_mut(gid) else { return };
+        if toggle_guard {
+            game.spoiler_guard = !game.spoiler_guard;
+        }
+        let guard = game.spoiler_guard;
         let Some(guide) = game.guides.iter_mut().find(|g| g.id == aid) else { return };
         if untick {
             guide.steps.iter_mut().for_each(|s| {
@@ -1312,6 +1795,8 @@ impl App {
 
         let next = guide.next_index(today);
         let mut acts: Vec<(usize, RowAct)> = Vec::new();
+        // spoiler guard: open items after the next one are covered until clicked
+        let veiled = |i: usize| guard && next.is_some_and(|n| i > n) && matches!(states[i], StepState::Open | StepState::DueSoon) && !revealed.contains(&(aid, i));
 
         if *left_view {
             // ---- What's left: area by area
@@ -1357,6 +1842,15 @@ impl App {
                                 let mut text = s.text.clone();
                                 if states[i] == StepState::DueSoon {
                                     text = format!("{text} (ends {})", s.deadline);
+                                }
+                                if veiled(i) {
+                                    let chip = egui::Frame::new().fill(INK).stroke(Stroke::new(1.0f32, INDIGO)).corner_radius(2).inner_margin(egui::Margin::symmetric(5, 1)).show(ui, |ui| {
+                                        ui.label(RichText::new("\u{2592}\u{2592}\u{2592}\u{2592}\u{2592}").color(DIM));
+                                    });
+                                    if chip.response.interact(Sense::click()).on_hover_text("Hidden by the spoiler guard: click to show").clicked() {
+                                        acts.push((i, RowAct::Reveal));
+                                    }
+                                    continue;
                                 }
                                 let chip = egui::Frame::new().fill(INK).stroke(Stroke::new(1.0f32, if Some(i) == next { MAGENTA } else { INDIGO })).corner_radius(2).inner_margin(egui::Margin::symmetric(5, 1)).show(ui, |ui| {
                                     let (ir, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
@@ -1514,6 +2008,8 @@ impl App {
                 }
             }
             let cursor = list_cursor.map(|(_, c)| c);
+            // a dashboard or search asked for an item
+            let scroll_item = scroll_to_item.take_if(|(g, _)| *g == aid).map(|(_, i)| i);
 
             egui::ScrollArea::vertical().id_salt(("checklist", aid)).auto_shrink([false, false]).show(ui, |ui| {
                 if shown == 0 {
@@ -1546,18 +2042,24 @@ impl App {
                     // Off-screen rows take their remembered height instead of being laid out.
                     let w = ui.available_width();
                     let open = open_rows.contains(&(aid, i));
-                    let print = row_fingerprint(s, states[i], is_next, can_find, w, compact, open);
+                    let thumb = if s.image.is_empty() || (compact && !open) || veiled(i) { None } else { thumb_of(&ctx, thumbs, &s.image) };
+                    let look = RowLook { state: states[i], is_next, can_find, compact, open, cursor: cursor == Some(i), veiled: veiled(i), thumb };
+                    let print = row_fingerprint(s, &look, w);
+                    let wanted = scroll_item == Some(i);
                     if let Some(&(fp, h)) = row_heights.get(&(aid, i)) {
                         let r = Rect::from_min_size(ui.cursor().min, Vec2::new(w, h));
-                        if fp == print && !(is_next && scroll_next) && !(cursor_moved && cursor == Some(i)) && !ui.is_rect_visible(r) {
+                        if fp == print && !(is_next && scroll_next) && !(cursor_moved && cursor == Some(i)) && !wanted && !ui.is_rect_visible(r) {
                             ui.allocate_space(Vec2::new(w, h));
                             ui.add_space(4.0);
                             continue;
                         }
                     }
-                    let resp = step_row(ui, s, i, states[i], is_next, can_find, compact, open, cursor == Some(i), &mut acts);
+                    let resp = step_row(ui, s, i, &look, &mut acts);
                     if cursor_moved && cursor == Some(i) {
                         resp.scroll_to_me(None);
+                    }
+                    if wanted {
+                        resp.scroll_to_me(Some(Align::Center));
                     }
                     row_heights.insert((aid, i), (print, resp.rect.height()));
                     if is_next && scroll_next {
@@ -1624,6 +2126,20 @@ impl App {
                 }
                 RowAct::Up if i > 0 => guide.steps.swap(i, i - 1),
                 RowAct::Down if i + 1 < guide.steps.len() => guide.steps.swap(i, i + 1),
+                RowAct::Reveal => {
+                    revealed.insert((aid, i));
+                }
+                RowAct::Note => *note_edit = Some((aid, i, guide.steps[i].note.clone())),
+                RowAct::Image => {
+                    let picked = rfd::FileDialog::new().set_title("Attach a screenshot or map").add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif", "bmp"]).pick_file();
+                    if let Some(f) = picked {
+                        guide.steps[i].image = f.display().to_string();
+                    }
+                }
+                RowAct::NoImage => guide.steps[i].image.clear(),
+                RowAct::OpenImage => {
+                    let _ = open::that_detached(&guide.steps[i].image);
+                }
                 _ => {}
             }
         }
@@ -2055,8 +2571,22 @@ impl App {
             if enabled {
                 glow_rect(p, r, 2.0, YELLOW, 4.0);
             }
-            if resp.on_hover_text("Reopen the last guide at your saved spot (Enter)").clicked() && enabled {
+            if resp.on_hover_text("Reopen the last guide at your saved spot and start the play timer (Enter)").clicked() && enabled {
                 go = true;
+            }
+            let mini = egui::Button::new(RichText::new("Mini").color(if self.mini_open { INK } else { YELLOW })).fill(if self.mini_open { YELLOW } else { INK }).stroke(Stroke::new(1.5f32, YELLOW));
+            if ui.add(mini).on_hover_text("A small always-on-top window with your next item, to tick while you play (Ctrl+Alt+M)").clicked() {
+                self.mini_open = !self.mini_open;
+            }
+            if let Some(p) = self.playing() {
+                let secs = p.session_start.map_or(0, |s| (model::now() - s).max(0) as u64);
+                let label = format!("\u{25a0} {}", model::fmt_clock(secs));
+                let tip = format!("Playing {}: click to stop the timer", p.title);
+                let id = p.id;
+                let b = egui::Button::new(RichText::new(label).color(YELLOW)).fill(INK).stroke(Stroke::new(1.5f32, YELLOW));
+                if ui.add(b).on_hover_text(tip).clicked() {
+                    self.stop_playing(id);
+                }
             }
             vline(ui);
 
@@ -2279,6 +2809,17 @@ impl App {
             self.online.send(Job::PageText { guide: guide_id, url });
         }
         if apply {
+            // keep the text for reading beside the checklist
+            if let Some((_, text)) = &self.bulk {
+                if text.trim().len() > 40 {
+                    if let Err(e) = model::save_page(&self.pages_dir, guide_id, text) {
+                        self.set_status_for(format!("Couldn't keep the guide's text: {e}"), 6.0);
+                    }
+                    if self.reader.as_ref().is_some_and(|r| r.guide == guide_id) {
+                        self.reader = None;
+                    }
+                }
+            }
             let parsed = self.bulk_cache.take().map(|c| c.1).unwrap_or_default();
             let replace = self.bulk_replace;
             for game in &mut self.lib.games {
@@ -2351,22 +2892,9 @@ impl App {
             });
         let term = q.clone();
         if let Some(h) = chosen {
-            self.selected = Some(h.game);
-            self.explorer_open = false;
-            if matches!(self.view, ViewMode::Game | ViewMode::Guides | ViewMode::Notes) {
-                self.view = ViewMode::All;
-            }
-            if let Some(gid) = h.guide {
-                self.active_list = Some(gid);
-                self.left_view = false;
-                self.list_section = None;
-                self.list_kind = None;
-                self.list_scope = None;
-                self.hide_done = false;
-                // filter the checklist to what was searched for
-                self.list_search = if h.item.is_some() { term } else { String::new() };
-                self.list_cursor = h.item.map(|i| (gid, i));
-            }
+            // filter the checklist to what was searched for
+            let search = if h.item.is_some() { term } else { String::new() };
+            self.go_to(h.game, h.guide, h.item, search);
             self.search_all = None;
         } else if !open {
             self.search_all = None;
@@ -2389,13 +2917,17 @@ impl App {
                     s.kind == StepKind::Achievement && (accounts::key(&s.text) == k || s.text.split_once(": ").is_some_and(|(_, r)| accounts::key(r) == k))
                 });
                 match hit {
-                    Some(s) if a.achieved => {
-                        if !s.done {
-                            ticked += 1;
+                    Some(s) => {
+                        if a.rarity.is_some() {
+                            s.rarity = a.rarity;
                         }
-                        s.done = true;
+                        if a.achieved {
+                            if !s.done {
+                                ticked += 1;
+                            }
+                            s.done = true;
+                        }
                     }
-                    Some(_) => {}
                     None => unmatched += 1,
                 }
             }
@@ -2412,7 +2944,7 @@ impl App {
             };
             let steps: Vec<Step> = list
                 .iter()
-                .map(|a| Step { kind: StepKind::Achievement, detail: a.description.clone(), done: a.achieved, section: "Achievements".into(), anchor: a.name.clone(), ..Step::task(a.name.clone()) })
+                .map(|a| Step { kind: StepKind::Achievement, detail: a.description.clone(), done: a.achieved, section: "Achievements".into(), anchor: a.name.clone(), rarity: a.rarity, ..Step::task(a.name.clone()) })
                 .collect();
             let mut guide = Guide::new(new_id, url);
             guide.title = format!("{} achievements ({})", source.label(), g.title);
@@ -2521,8 +3053,11 @@ impl App {
             platform: String,
             done: usize,
             total: usize,
-            left: Vec<(String, bool)>,
+            /// (name, missable, rarity)
+            left: Vec<(String, bool, Option<f32>)>,
+            played: u64,
         }
+        let at = model::now();
         let mut rows: Vec<Row> = self
             .lib
             .games
@@ -2537,7 +3072,13 @@ impl App {
                     platform: g.platform.clone(),
                     done: ach.iter().filter(|s| s.done).count(),
                     total: ach.len(),
-                    left: ach.iter().filter(|s| !s.done).map(|s| (s.text.clone(), s.detail.starts_with("Missable"))).collect(),
+                    left: {
+                        let mut v: Vec<(String, bool, Option<f32>)> = ach.iter().filter(|s| !s.done).map(|s| (s.text.clone(), s.is_missable(), s.rarity)).collect();
+                        // easiest (most players have it) first, when the platform says
+                        v.sort_by(|a, b| b.2.unwrap_or(-1.0).total_cmp(&a.2.unwrap_or(-1.0)));
+                        v
+                    },
+                    played: g.played(at),
                 })
             })
             .collect();
@@ -2565,6 +3106,9 @@ impl App {
                         icons::trophy(ui.painter(), ir, if r.done == r.total { GREEN } else { YELLOW });
                         ui.label(RichText::new(&r.title).font(bold(17.0)).color(WHITE));
                         ui.label(RichText::new(&r.platform).small().color(DIM));
+                        if r.played >= 60 {
+                            ui.label(RichText::new(format!("\u{b7} played {}", model::fmt_duration(r.played))).small().color(DIM));
+                        }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui.button("Sync\u{2026}").on_hover_text("Pull earned achievements from Steam or Xbox").clicked() {
                                 sync = Some(r.game);
@@ -2580,9 +3124,14 @@ impl App {
                     if !r.left.is_empty() {
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            ui.label(RichText::new(format!("{} left:", r.left.len())).small().color(TEAL));
-                            for (name, missable) in r.left.iter().take(12) {
-                                tag(ui, name, if *missable { MAGENTA } else { DIM });
+                            let sorted = r.left.iter().any(|l| l.2.is_some());
+                            ui.label(RichText::new(format!("{} left{}:", r.left.len(), if sorted { ", easiest first" } else { "" })).small().color(TEAL));
+                            for (name, missable, rarity) in r.left.iter().take(12) {
+                                let text = match rarity {
+                                    Some(p) => format!("{name} ({p:.0}%)"),
+                                    None => name.clone(),
+                                };
+                                tag(ui, &text, if *missable { MAGENTA } else { DIM });
                             }
                             if r.left.len() > 12 {
                                 ui.label(RichText::new(format!("+{} more", r.left.len() - 12)).small().color(DIM));
@@ -2604,6 +3153,532 @@ impl App {
         if let Some(game) = sync {
             self.sync_window = Some(game);
             self.sync_note.clear();
+        }
+    }
+
+    /// Everything that can still be missed, across games: due soon first, then by deadline, then
+    /// items the guides call missable.
+    fn missables_view(&mut self, ui: &mut Ui) {
+        struct Item {
+            guide: u64,
+            idx: usize,
+            text: String,
+            place: String,
+            state: StepState,
+            deadline: String,
+            /// Days until the deadline (in-game), for sorting.
+            days: i64,
+        }
+        let include_all = self.missables_all;
+        let mut games: Vec<&Game> = self.lib.games.iter().filter(|g| include_all || !matches!(g.status, Status::Completed | Status::Dropped)).collect();
+        games.sort_by(|a, b| a.status.rank().cmp(&b.status.rank()).then(a.title.to_lowercase().cmp(&b.title.to_lowercase())));
+        let mut groups: Vec<(u64, String, String, String, Vec<Item>)> = Vec::new();
+        for g in games {
+            let today = g.today();
+            let mut items = Vec::new();
+            for gd in &g.guides {
+                let next = gd.next_index(today);
+                for (i, s) in gd.steps.iter().enumerate() {
+                    if !s.is_open(today) || !s.is_missable() {
+                        continue;
+                    }
+                    let hidden = g.spoiler_guard && next.is_some_and(|n| i > n) && !self.revealed.contains(&(gd.id, i));
+                    let days = match (today, model::parse_md(&s.deadline)) {
+                        (Some(t), Some(d)) => (d.0 as i64 * 31 + d.1 as i64) - (t.0 as i64 * 31 + t.1 as i64),
+                        (None, Some(d)) => d.0 as i64 * 31 + d.1 as i64,
+                        _ => i64::MAX,
+                    };
+                    let place = if s.section.is_empty() { gd.title.clone() } else { format!("{} \u{203a} {}", gd.title, s.section) };
+                    items.push(Item {
+                        guide: gd.id,
+                        idx: i,
+                        text: if hidden { "\u{2592}\u{2592}\u{2592}\u{2592}  (spoiler guard)".into() } else { s.text.clone() },
+                        place,
+                        state: s.state(today),
+                        deadline: s.deadline.clone(),
+                        days,
+                    });
+                }
+            }
+            if items.is_empty() {
+                continue;
+            }
+            items.sort_by(|a, b| (b.state == StepState::DueSoon).cmp(&(a.state == StepState::DueSoon)).then(a.days.cmp(&b.days)));
+            groups.push((g.id, g.title.clone(), g.platform.clone(), g.game_date.clone(), items));
+        }
+        let total: usize = groups.iter().map(|g| g.4.len()).sum();
+        let due: usize = groups.iter().flat_map(|g| &g.4).filter(|i| i.state == StepState::DueSoon).count();
+        ui.horizontal(|ui| {
+            let mut head = format!("{total} things you could still miss, in {} games", groups.len());
+            if due > 0 {
+                head.push_str(&format!(" \u{b7} {due} due soon"));
+            }
+            ui.label(RichText::new(head).font(bold(18.0)).color(YELLOW));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.checkbox(&mut self.missables_all, "Include finished and dropped games");
+            });
+        });
+        ui.label(RichText::new("Items with a deadline, or that a guide calls missable. Set a game's In-game date to see what's due soon.").small().color(DIM));
+        ui.add_space(6.0);
+        let mut tick: Option<(u64, u64, usize)> = None;
+        let mut show: Option<(u64, u64, usize)> = None;
+        egui::ScrollArea::vertical().id_salt("missables").auto_shrink([false, false]).show(ui, |ui| {
+            if groups.is_empty() {
+                ui.add_space(16.0);
+                ui.vertical_centered(|ui| ui.label(RichText::new("Nothing missable left. Nice.").font(bold(18.0)).color(GREEN)));
+            }
+            for (gid, title, platform, date, items) in &groups {
+                egui::Frame::new().fill(CARD_BG).stroke(Stroke::new(1.0f32, INDIGO)).corner_radius(3).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(title).font(bold(17.0)).color(WHITE));
+                        ui.label(RichText::new(platform).small().color(DIM));
+                        if !date.is_empty() {
+                            ui.label(RichText::new(format!("\u{b7} in-game date {date}")).small().color(TEAL));
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(RichText::new(format!("{}", items.len())).font(bold(16.0)).color(YELLOW));
+                        });
+                    });
+                    for it in items.iter().take(40) {
+                        ui.horizontal(|ui| {
+                            if big_checkbox(ui, false).on_hover_text("Tick off").clicked() {
+                                tick = Some((*gid, it.guide, it.idx));
+                            }
+                            let col = if it.state == StepState::DueSoon { MAGENTA } else { WHITE };
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.small_button("Show").on_hover_text("Open it in the checklist").clicked() {
+                                    show = Some((*gid, it.guide, it.idx));
+                                }
+                                match it.state {
+                                    StepState::DueSoon => tag(ui, &format!("Ends {}", it.deadline), MAGENTA),
+                                    _ if !it.deadline.is_empty() => tag(ui, &format!("Ends {}", it.deadline), DIM),
+                                    _ => tag(ui, "missable", DIM),
+                                }
+                                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                    ui.add(egui::Label::new(RichText::new(&it.text).color(col)).truncate());
+                                    ui.add(egui::Label::new(RichText::new(&it.place).small().color(DIM)).truncate());
+                                });
+                            });
+                        });
+                    }
+                    if items.len() > 40 {
+                        ui.label(RichText::new(format!("+{} more", items.len() - 40)).small().color(DIM));
+                    }
+                });
+                ui.add_space(6.0);
+            }
+        });
+        if let Some((gid, lid, i)) = tick {
+            if let Some(g) = self.lib.game_mut(gid) {
+                let today = g.today();
+                if let Some(gd) = g.guides.iter_mut().find(|x| x.id == lid) {
+                    if let Some(s) = gd.steps.get_mut(i) {
+                        s.done = true;
+                        s.missed = false;
+                        let t = s.text.clone();
+                        gd.follow_checklist(today);
+                        g.touch();
+                        self.set_status(format!("Ticked {t}"));
+                    }
+                }
+            }
+        }
+        if let Some((gid, lid, i)) = show {
+            self.go_to(gid, Some(lid), Some(i), String::new());
+        }
+    }
+
+    /// The mini window's contents: the next item of the current checklist, with Tick.
+    fn mini_contents(&mut self, ui: &mut Ui) {
+        enum MiniAct {
+            Tick,
+            Untick,
+            Find(String),
+            Focus,
+        }
+        let mut act = None;
+        let Some((gid, lid)) = self.current_list() else {
+            ui.label(RichText::new("Pick a game with a checklist in JAGT.").color(TEAL));
+            return;
+        };
+        let Some(game) = self.lib.games.iter().find(|g| g.id == gid) else { return };
+        let Some(guide) = game.guides.iter().find(|g| g.id == lid) else { return };
+        let today = game.today();
+        let done = guide.steps.iter().filter(|s| s.done).count();
+        let counted = guide.steps.iter().filter(|s| !s.missed).count().max(1);
+        ui.horizontal(|ui| {
+            ui.add(egui::Label::new(RichText::new(&game.title).font(bold(16.0)).color(YELLOW)).truncate());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(format!("{done}/{counted}")).color(TEAL));
+                if let Some(s) = game.session_start {
+                    ui.label(RichText::new(model::fmt_clock((model::now() - s).max(0) as u64)).color(MAGENTA));
+                }
+            });
+        });
+        match guide.next_index(today).map(|i| &guide.steps[i]) {
+            Some(s) => {
+                if !s.section.is_empty() {
+                    ui.add(egui::Label::new(RichText::new(&s.section).small().color(DIM)).truncate());
+                }
+                ui.add(egui::Label::new(RichText::new(&s.text).font(bold(18.0)).color(WHITE)).wrap());
+                for t in [&s.detail, &s.how, &s.note] {
+                    if !t.is_empty() {
+                        ui.add(egui::Label::new(RichText::new(t).small().color(DIM)).truncate()).on_hover_text(t.as_str());
+                    }
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button(RichText::new("\u{2714} Tick").font(bold(16.0)).color(GREEN)).on_hover_text("Ctrl+Alt+Space, even while the game has the focus").clicked() {
+                        act = Some(MiniAct::Tick);
+                    }
+                    if ui.add_enabled(!self.hotkey_ticks.is_empty(), egui::Button::new("Untick")).on_hover_text("Ctrl+Alt+Backspace").clicked() {
+                        act = Some(MiniAct::Untick);
+                    }
+                    let web = guide.kind != Kind::Video && guide.kind != Kind::Sheet && !links::is_local(&guide.url);
+                    if web && !s.anchor.is_empty() && ui.button("Find in guide").clicked() {
+                        let page = if s.url.is_empty() { &guide.url } else { &s.url };
+                        act = Some(MiniAct::Find(links::with_text(page, &s.anchor)));
+                    }
+                    if ui.button("JAGT").on_hover_text("Bring the main window back").clicked() {
+                        act = Some(MiniAct::Focus);
+                    }
+                });
+            }
+            None => {
+                ui.label(RichText::new("All done!").font(bold(18.0)).color(GREEN));
+            }
+        }
+        match act {
+            Some(MiniAct::Tick) => {
+                self.tick_next();
+            }
+            Some(MiniAct::Untick) => self.untick_last(),
+            Some(MiniAct::Find(url)) => {
+                let _ = open::that_detached(url);
+            }
+            Some(MiniAct::Focus) => {
+                ui.ctx().send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(false));
+                ui.ctx().send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+            }
+            None => {}
+        }
+    }
+
+    /// The small always-on-top window: what to do next, while you play.
+    fn mini_window(&mut self, ctx: &egui::Context) {
+        if !self.mini_open {
+            return;
+        }
+        let builder = egui::ViewportBuilder::default()
+            .with_title("JAGT \u{2014} next")
+            .with_inner_size([400.0, 180.0])
+            .with_min_inner_size([260.0, 120.0])
+            .with_always_on_top()
+            .with_resizable(true);
+        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("jagt-mini"), builder, |ctx, class| {
+            if class == egui::ViewportClass::Embedded {
+                // no separate windows (tests, some Linux setups): an ordinary egui window instead
+                let mut open = true;
+                egui::Window::new(RichText::new("Next").font(bold(16.0))).id(egui::Id::new("mini-embedded")).open(&mut open).default_width(380.0).show(ctx, |ui| self.mini_contents(ui));
+                if !open {
+                    self.mini_open = false;
+                }
+                return;
+            }
+            egui::CentralPanel::default().frame(egui::Frame::new().fill(INK).stroke(Stroke::new(2.0f32, YELLOW)).inner_margin(egui::Margin::same(8))).show(ctx, |ui| self.mini_contents(ui));
+            if ctx.input(|i| i.viewport().close_requested()) {
+                self.mini_open = false;
+            }
+        });
+    }
+
+    /// Checklist, with the guide's text beside it (or below, when the window is narrow).
+    fn checklist_area(&mut self, ui: &mut Ui, gid: u64, lone: bool) -> Option<WinButton> {
+        if !self.reader_open {
+            return window_ctl(ui, "Checklist", lone, |ui| self.checklist_view(ui, gid)).1;
+        }
+        let avail = ui.available_rect_before_wrap();
+        let gap = 10.0;
+        let (a, b) = if avail.width() >= 700.0 {
+            let w = ((avail.width() - gap) * 0.5).floor();
+            (Rect::from_min_size(avail.min, Vec2::new(w, avail.height())), Rect::from_min_max(Pos2::new(avail.left() + w + gap, avail.top()), avail.max))
+        } else {
+            let h = ((avail.height() - gap) * 0.55).floor();
+            (Rect::from_min_size(avail.min, Vec2::new(avail.width(), h)), Rect::from_min_max(Pos2::new(avail.left(), avail.top() + h + gap), avail.max))
+        };
+        let mut button = None;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(a), |ui| {
+            button = window_ctl(ui, "Checklist", lone, |ui| self.checklist_view(ui, gid)).1;
+        });
+        ui.scope_builder(egui::UiBuilder::new().max_rect(b), |ui| {
+            window(ui, "Guide text", |ui| self.reader_view(ui, gid));
+        });
+        ui.allocate_rect(avail, Sense::hover());
+        button
+    }
+
+    /// The guide's own text, scrolled to the item you're on.
+    fn reader_view(&mut self, ui: &mut Ui, gid: u64) {
+        let Some(game) = self.lib.games.iter().find(|g| g.id == gid) else { return };
+        let Some(aid) = self.active_list.filter(|id| game.guides.iter().any(|g| g.id == *id)) else {
+            ui.label(RichText::new("Pick a guide's checklist first.").color(DIM));
+            return;
+        };
+        let guide = game.guides.iter().find(|g| g.id == aid).unwrap();
+        let today = game.today();
+        let (url, kind) = (guide.url.clone(), guide.kind);
+        // the item to follow: the keyboard highlight, else the next one
+        let item = self.list_cursor.filter(|(g, _)| *g == aid).map(|(_, i)| i).or_else(|| guide.next_index(today));
+        let item_info = item.and_then(|i| guide.steps.get(i).map(|s| (i, s.section.clone(), s.text.clone(), s.anchor.clone())));
+
+        if self.reader.as_ref().is_none_or(|r| r.guide != aid) {
+            let text = model::load_page(&self.pages_dir, aid).or_else(|| {
+                // a guide that is a text / web page file on this PC is read straight from it
+                let path = links::local_path(&url)?;
+                let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+                let raw = String::from_utf8_lossy(&std::fs::read(&path).ok()?).into_owned();
+                match ext.as_str() {
+                    "html" | "htm" => Some(online::html_to_text(&raw)),
+                    "txt" | "md" | "csv" => Some(raw),
+                    _ => None,
+                }
+            });
+            self.reader = text.map(|t| Reader::new(aid, &t));
+        }
+        let web = kind != Kind::Video && kind != Kind::Sheet && !links::is_local(&url);
+        if self.reader.is_none() {
+            ui.add_space(12.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("No text for this guide yet").font(bold(18.0)).color(TEAL));
+                ui.label(RichText::new("Fetch the page, or paste its text with Paste checklist (the text is kept for reading here).").small().color(DIM));
+                ui.add_space(6.0);
+                let fetching = self.reader_fetching == Some(aid);
+                if web && ui.add_enabled(!fetching, egui::Button::new(if fetching { "Fetching\u{2026}" } else { "Fetch the page text" })).clicked() {
+                    if self.online_on {
+                        self.reader_fetching = Some(aid);
+                        self.online.send(Job::PageText { guide: aid, url: url.clone() });
+                    } else {
+                        self.set_status("Turn Online on to fetch the page");
+                    }
+                }
+                if ui.button("Paste the text\u{2026}").clicked() {
+                    self.bulk = Some((aid, String::new()));
+                }
+            });
+            ui.allocate_space(ui.available_size());
+            return;
+        }
+        let r = self.reader.as_mut().unwrap();
+
+        // follow the item
+        let key = item_info.as_ref().map(|(i, _, t, _)| format!("{i}:{t}")).unwrap_or_default();
+        if key != r.target_key {
+            r.target_key = key;
+            r.target = item_info.as_ref().and_then(|(_, sec, text, anchor)| find_line(&r.lines, sec, text, anchor));
+            if r.target.is_some() {
+                r.jump = r.target;
+            }
+        }
+        // ---- toolbar
+        let mut refetch = false;
+        ui.horizontal_wrapped(|ui| {
+            let resp = ui.add(egui::TextEdit::singleline(&mut self.reader_find).id_salt(("reader-find", aid)).hint_text("Find in the text\u{2026}").desired_width(150.0));
+            let q = self.reader_find.trim().to_lowercase();
+            if q != r.found_for {
+                r.found_for = q.clone();
+                r.found = if q.chars().count() < 2 { Vec::new() } else { r.lines.iter().enumerate().filter(|(_, l)| l.to_lowercase().contains(&q)).map(|(i, _)| i).collect() };
+                r.found_at = 0;
+                r.jump = r.found.first().copied();
+            }
+            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            if !r.found.is_empty() {
+                ui.label(RichText::new(format!("{}/{}", r.found_at + 1, r.found.len())).small().color(TEAL));
+                if ui.small_button("Next").clicked() || enter {
+                    r.found_at = (r.found_at + 1) % r.found.len();
+                    r.jump = Some(r.found[r.found_at]);
+                    if enter {
+                        resp.request_focus();
+                    }
+                }
+            } else if q.chars().count() >= 2 {
+                ui.label(RichText::new("not found").small().color(DIM));
+            }
+            if ui.add_enabled(r.target.is_some(), egui::Button::new("My place")).on_hover_text("Back to the item you're on").clicked() {
+                r.jump = r.target;
+            }
+            if web && ui.small_button("Fetch again").on_hover_text("Download the page's text again").clicked() {
+                refetch = true;
+            }
+            if item_info.is_some() && r.target.is_none() {
+                ui.label(RichText::new("(couldn't find your item in the text)").small().color(DIM));
+            }
+        });
+        ui.add_space(2.0);
+
+        // ---- the text: only the lines on screen are laid out
+        let width = (ui.available_width() - 14.0).max(80.0);
+        if (r.width - width).abs() > 1.0 {
+            r.width = width;
+            r.heights = r.lines.iter().map(|l| estimate_line(l, width)).collect();
+        }
+        let mut tops = Vec::with_capacity(r.lines.len() + 1);
+        let mut y = 0.0;
+        for h in &r.heights {
+            tops.push(y);
+            y += h;
+        }
+        let total = y;
+        let mut area = egui::ScrollArea::vertical().id_salt(("reader", aid)).auto_shrink([false, false]);
+        if let Some(t) = r.jump.take() {
+            area = area.vertical_scroll_offset((tops.get(t).copied().unwrap_or(0.0) - 60.0).max(0.0));
+        }
+        let mut changed = false;
+        let found: HashSet<usize> = r.found.iter().copied().collect();
+        let current_find = r.found.get(r.found_at).copied();
+        area.show_viewport(ui, |ui, vp| {
+            let origin = ui.max_rect().min;
+            ui.set_min_height(total);
+            ui.set_min_width(width);
+            let first = tops.partition_point(|&t| t <= vp.min.y).saturating_sub(1);
+            for i in first..r.lines.len() {
+                if tops[i] > vp.max.y {
+                    break;
+                }
+                let line = &r.lines[i];
+                let rect = Rect::from_min_size(origin + Vec2::new(0.0, tops[i]), Vec2::new(width, r.heights[i]));
+                if Some(i) == r.target {
+                    ui.painter().rect_filled(rect, 2.0, MAGENTA.gamma_multiply(0.22));
+                    ui.painter().rect_filled(Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())), 0.0, MAGENTA);
+                } else if Some(i) == current_find {
+                    ui.painter().rect_filled(rect, 2.0, YELLOW.gamma_multiply(0.25));
+                } else if found.contains(&i) {
+                    ui.painter().rect_filled(rect, 2.0, YELLOW.gamma_multiply(0.1));
+                }
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let text = match line.strip_prefix("## ") {
+                    Some(h) => RichText::new(h).font(bold(18.0)).color(YELLOW),
+                    None => RichText::new(line).color(WHITE),
+                };
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(rect.min + Vec2::new(6.0, 2.0), Vec2::new(width - 8.0, 10_000.0))).layout(Layout::top_down(Align::Min)));
+                child.add(egui::Label::new(text).wrap());
+                let h = child.min_rect().height() + 4.0;
+                if (h - r.heights[i]).abs() > 0.5 {
+                    r.heights[i] = h;
+                    changed = true;
+                }
+            }
+        });
+        if changed {
+            ui.ctx().request_repaint();
+        }
+        if refetch {
+            if self.online_on {
+                self.reader_fetching = Some(aid);
+                self.online.send(Job::PageText { guide: aid, url });
+                self.set_status("Fetching the page\u{2026}");
+            } else {
+                self.set_status("Turn Online on to fetch the page");
+            }
+        }
+    }
+
+    /// "New run" (New Game+): which ticks to keep.
+    fn run_window(&mut self, ctx: &egui::Context) {
+        let Some((gid, name, keep, keep_ach)) = &mut self.run_window else { return };
+        let gid = *gid;
+        let Some(game) = self.lib.games.iter().find(|g| g.id == gid) else {
+            self.run_window = None;
+            return;
+        };
+        let mut open = true;
+        let mut start = false;
+        egui::Window::new(RichText::new("Start a new run").font(bold(18.0)))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .pivot(Align2::CENTER_CENTER)
+            .default_pos(ctx.screen_rect().center())
+            .show(ctx, |ui| {
+                ui.label(RichText::new(format!("\"{}\" is kept with all its ticks: switch back to it from the Run menu any time.", game.run_label())).color(DIM));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Name").color(TEAL));
+                    ui.add(egui::TextEdit::singleline(name).desired_width(220.0));
+                });
+                ui.checkbox(keep_ach, "Keep achievements and trophies ticked (you've earned them)");
+                ui.add_space(4.0);
+                ui.label(RichText::new("Keep these guides ticked as they are:").color(TEAL));
+                for g in game.guides.iter().filter(|g| !g.steps.is_empty()) {
+                    let mut on = keep.contains(&g.id);
+                    let done = g.steps.iter().filter(|s| s.done).count();
+                    if ui.checkbox(&mut on, format!("{}  ({done}/{})", g.title, g.steps.len())).changed() {
+                        if on {
+                            keep.insert(g.id);
+                        } else {
+                            keep.remove(&g.id);
+                        }
+                    }
+                }
+                ui.label(RichText::new("Everything else starts unticked.").small().color(DIM));
+                ui.add_space(6.0);
+                if ui.button(RichText::new("Start the new run").font(bold(16.0))).clicked() {
+                    start = true;
+                }
+            });
+        if start {
+            let (name, keep, keep_ach) = (name.clone(), keep.iter().copied().collect::<Vec<u64>>(), *keep_ach);
+            if let Some(g) = self.lib.game_mut(gid) {
+                g.new_run(&name, &keep, keep_ach, model::now());
+                let label = g.run_label();
+                self.set_status(format!("Started {label}"));
+            }
+            self.revealed.clear();
+            self.run_window = None;
+        } else if !open {
+            self.run_window = None;
+        }
+    }
+
+    /// Editing an item's note.
+    fn note_window(&mut self, ctx: &egui::Context) {
+        let Some((lid, i, text)) = &mut self.note_edit else { return };
+        let (lid, i) = (*lid, *i);
+        let Some(step) = self.lib.games.iter().flat_map(|g| &g.guides).find(|g| g.id == lid).and_then(|g| g.steps.get(i)) else {
+            self.note_edit = None;
+            return;
+        };
+        let mut open = true;
+        let mut save = false;
+        egui::Window::new(RichText::new("Note").font(bold(18.0)))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(420.0)
+            .pivot(Align2::CENTER_CENTER)
+            .default_pos(ctx.screen_rect().center())
+            .show(ctx, |ui| {
+                ui.label(RichText::new(&step.text).font(bold(16.0)).color(WHITE));
+                let r = ui.add(egui::TextEdit::multiline(text).id_salt("note-edit").desired_rows(5).desired_width(f32::INFINITY).hint_text("e.g. Came back for this after chapter 5. Needs the grappling hook."));
+                if !r.has_focus() && text.is_empty() {
+                    r.request_focus();
+                }
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Save").font(bold(16.0))).clicked() {
+                        save = true;
+                    }
+                    ui.label(RichText::new("Shows under the item, and Find searches it.").small().color(DIM));
+                });
+            });
+        if save {
+            let t = text.trim().to_string();
+            if let Some(s) = self.lib.games.iter_mut().flat_map(|g| &mut g.guides).find(|g| g.id == lid).and_then(|g| g.steps.get_mut(i)) {
+                s.note = t;
+            }
+            self.note_edit = None;
+        } else if !open {
+            self.note_edit = None;
         }
     }
 
@@ -2725,6 +3800,33 @@ impl App {
                     self.favicons.clear();
                     self.set_status("Icon cache cleared");
                 }
+
+                if ui
+                    .add_enabled(self.link_checks == 0, egui::Button::new(if self.link_checks > 0 { format!("Checking links\u{2026} {} to go", self.link_checks) } else { "Check every guide link".to_string() }))
+                    .on_hover_text("Finds guide pages that have gone (404), and offers the Wayback Machine's copy")
+                    .clicked()
+                {
+                    self.check_links(None);
+                }
+
+                heading(ui, "While you play");
+                ui.checkbox(&mut self.mini_open, "Mini window: your next item, always on top");
+                for (_, keys, what) in hotkeys::KEYS {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(keys).color(TEAL));
+                        ui.label(RichText::new(what).small().color(DIM));
+                        match &self.hotkeys {
+                            Some(h) if h.taken.contains(&keys) => {
+                                ui.label(RichText::new("(another program uses it)").small().color(MAGENTA));
+                            }
+                            None => {
+                                ui.label(RichText::new("(not available)").small().color(DIM));
+                            }
+                            _ => {}
+                        }
+                    });
+                }
+                ui.label(RichText::new("These work even while the game has the focus. Continue starts the play timer; closing JAGT stops it.").small().color(DIM));
 
                 heading(ui, "Accounts (achievement sync)");
                 ui.label(RichText::new("Used by Sync achievements on each game. Stored only in this PC's settings file.").small().color(DIM));
@@ -2907,7 +4009,20 @@ impl App {
                 || i.pointer.any_released()
                 || i.events.iter().any(|e| !matches!(e, egui::Event::PointerMoved(_) | egui::Event::PointerGone | egui::Event::WindowFocused(_)))
         });
-        let pumped = self.pump(ctx);
+        let mut pumped = self.pump(ctx);
+        let pressed = self.hotkeys.as_ref().map(|h| h.poll()).unwrap_or_default();
+        pumped |= !pressed.is_empty();
+        for a in pressed {
+            match a {
+                HotAction::TickNext => {
+                    if self.tick_next().is_none() {
+                        self.set_status("Nothing to tick: pick a game with a checklist");
+                    }
+                }
+                HotAction::UndoTick => self.untick_last(),
+                HotAction::ToggleMini => self.mini_open = !self.mini_open,
+            }
+        }
         self.keyboard(ctx);
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
         if !dropped.is_empty() {
@@ -2951,7 +4066,7 @@ impl App {
         };
         // a title-bar button clicked this frame: (which window, which button)
         let mut win: Option<(ViewMode, WinButton)> = None;
-        if let Some(gid) = gid.filter(|_| !self.explorer_open && !self.trophies_open && view == ViewMode::All) {
+        if let Some(gid) = gid.filter(|_| !self.explorer_open && !self.trophies_open && !self.missables_open && view == ViewMode::All) {
             egui::SidePanel::right("journal").resizable(true).default_width(330.0).width_range(260.0..=520.0).frame(pad).show(ctx, |ui| {
                 contained(ui, |ui| {
                     if let (_, Some(b)) = window_ctl(ui, "Where I Left Off", false, |ui| self.resume_view(ui, gid)) {
@@ -2972,6 +4087,9 @@ impl App {
             _ if self.trophies_open => {
                 window(ui, "Trophies", |ui| self.trophies_view(ui));
             }
+            _ if self.missables_open => {
+                window(ui, "Missables", |ui| self.missables_view(ui));
+            }
             Some(gid) if view != ViewMode::All => {
                 // one window gets all the space
                 let (_, b) = match view {
@@ -2980,7 +4098,7 @@ impl App {
                         ui.allocate_space(ui.available_size());
                     }),
                     ViewMode::Guides => window_ctl(ui, "Guides", true, |ui| self.guides_view(ui, gid, f32::INFINITY)),
-                    ViewMode::Checklist => window_ctl(ui, "Checklist", true, |ui| self.checklist_view(ui, gid)),
+                    ViewMode::Checklist => ((), self.checklist_area(ui, gid, true)),
                     _ => {
                         let (_, a) = window_ctl(ui, "Where I Left Off", true, |ui| self.resume_view(ui, gid));
                         ui.add_space(12.0);
@@ -3003,7 +4121,7 @@ impl App {
                         win = Some((ViewMode::Guides, b));
                     }
                     ui.add_space(12.0);
-                    if let (_, Some(b)) = window_ctl(ui, "Checklist", false, |ui| self.checklist_view(ui, gid)) {
+                    if let Some(b) = self.checklist_area(ui, gid, false) {
                         win = Some((ViewMode::Checklist, b));
                     }
                 } else if let (_, Some(b)) = window_ctl(ui, "Guides", false, |ui| self.guides_view(ui, gid, f32::INFINITY)) {
@@ -3055,7 +4173,10 @@ impl App {
         self.tick_list_window(ctx);
         self.search_all_window(ctx);
         self.sync_window(ctx);
+        self.run_window(ctx);
+        self.note_window(ctx);
         self.settings_window(ctx);
+        self.mini_window(ctx);
         self.autosave(had_input || pumped);
         self.watch_file(now);
 
@@ -3098,11 +4219,19 @@ impl eframe::App for App {
             ex_path: self.ex_path.clone(),
             window_size: self.window_size.map(|s| [s.x, s.y]),
             maximized: self.maximized,
+            mini_open: self.mini_open,
+            tag_filter: self.tag_filter.clone(),
+            reader_open: self.reader_open,
         };
         eframe::set_value(storage, "jagt", &saved);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // closing JAGT ends the play session
+        let running: Vec<u64> = self.lib.games.iter().filter(|g| g.session_start.is_some()).map(|g| g.id).collect();
+        for id in running {
+            self.stop_playing(id);
+        }
         self.flush();
     }
 
@@ -3188,9 +4317,19 @@ fn guide_card(ui: &mut Ui, g: &mut Guide, c: &mut CardCtx) -> Vec<CardAct> {
                                 acts.push(CardAct::ShowInFolder);
                                 ui.close_menu();
                             }
-                        } else if ui.button("Look up title again").clicked() {
-                            acts.push(CardAct::Refetch);
-                            ui.close_menu();
+                        } else {
+                            if ui.button("Look up title again").clicked() {
+                                acts.push(CardAct::Refetch);
+                                ui.close_menu();
+                            }
+                            if ui.button("Check the page still exists").clicked() {
+                                acts.push(CardAct::CheckLink);
+                                ui.close_menu();
+                            }
+                            if ui.button("Open the archived copy").on_hover_text("The Wayback Machine's latest copy of this page").clicked() {
+                                acts.push(CardAct::Archive);
+                                ui.close_menu();
+                            }
                         }
                         if ui.button("Paste checklist…").clicked() {
                             acts.push(CardAct::BulkSteps);
@@ -3202,6 +4341,12 @@ fn guide_card(ui: &mut Ui, g: &mut Guide, c: &mut CardCtx) -> Vec<CardAct> {
                             ui.close_menu();
                         }
                     });
+                    if g.dead {
+                        if ui.button(RichText::new("Archived copy").color(YELLOW)).on_hover_text("The page is gone: open the Wayback Machine's copy").clicked() {
+                            acts.push(CardAct::Archive);
+                        }
+                        tag(ui, "page gone", MAGENTA);
+                    }
                     if compact && !g.steps.is_empty() {
                         let label = format!("Checklist {}/{}", g.steps.iter().filter(|s| s.done).count(), g.steps.len());
                         if ui.button(RichText::new(label).color(TEAL)).on_hover_text("Show this guide's checklist").clicked() {
@@ -3748,6 +4893,24 @@ fn trophies_icon(ui: &mut Ui, active: bool) -> egui::Response {
     resp.on_hover_text("Every game's trophy and achievement progress in one place")
 }
 
+/// The header's Missables icon: a warning sign.
+fn missables_icon(ui: &mut Ui, active: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(66.0, 56.0), Sense::click());
+    let p = ui.painter();
+    if active || resp.hovered() {
+        p.rect_filled(rect, 3.0, if active { INDIGO } else { white_a(10) });
+        p.rect_stroke(rect, 3.0, Stroke::new(1.0f32, if active { YELLOW } else { TEAL }), StrokeKind::Inside);
+    }
+    let c = rect.center_top() + Vec2::new(0.0, 20.0);
+    let tri = vec![c + Vec2::new(0.0, -13.0), c + Vec2::new(14.0, 11.0), c + Vec2::new(-14.0, 11.0)];
+    p.add(egui::Shape::convex_polygon(tri, YELLOW, Stroke::new(2.0f32, MAGENTA)));
+    p.rect_filled(Rect::from_center_size(c + Vec2::new(0.0, -1.0), Vec2::new(3.0, 11.0)), 0.0, INK);
+    p.rect_filled(Rect::from_center_size(c + Vec2::new(0.0, 7.0), Vec2::splat(3.0)), 0.0, INK);
+    let fg = if active { YELLOW } else if resp.hovered() { TEAL } else { WHITE };
+    p.text(rect.center_bottom() - Vec2::new(0.0, 3.0), Align2::CENTER_BOTTOM, "Missables", pixel(14.0), fg);
+    resp.on_hover_text("Everything you could still miss, across all your games")
+}
+
 /// The header's Explorer icon, next to the status icons.
 fn explorer_icon(ui: &mut Ui, active: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(66.0, 56.0), Sense::click());
@@ -3854,12 +5017,40 @@ fn game_row(ui: &mut Ui, g: &Game, sel: bool, n: usize, indent: f32, width: f32,
 }
 
 /// Everything that decides a checklist row's height. If it's unchanged, the remembered height holds.
-#[allow(clippy::too_many_arguments)]
-fn row_fingerprint(s: &Step, state: StepState, is_next: bool, can_find: bool, width: f32, compact: bool, open: bool) -> u64 {
+fn row_fingerprint(s: &Step, look: &RowLook, width: f32) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (&s.text, &s.detail, &s.how, &s.reward, &s.deadline, s.optional, s.hidden).hash(&mut h);
-    (state as u8, is_next, can_find, width.round() as i32, compact, open).hash(&mut h);
+    (&s.note, &s.image, s.rarity.map(f32::to_bits)).hash(&mut h);
+    (look.state as u8, look.is_next, look.can_find, width.round() as i32, look.compact, look.open, look.veiled, look.thumb.map(|t| (t.1.x as i32, t.1.y as i32))).hash(&mut h);
     h.finish()
+}
+
+/// An item's image, loaded (scaled down) the first time it's shown.
+fn thumb_of(ctx: &egui::Context, thumbs: &mut HashMap<String, Fav>, path: &str) -> Option<(egui::TextureId, Vec2)> {
+    let entry = thumbs.entry(path.to_string()).or_insert_with(|| match image::open(path) {
+        Ok(img) => {
+            let img = img.thumbnail(640, 360).to_rgba8();
+            let size = [img.width() as usize, img.height() as usize];
+            let ci = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+            Fav::Ready(ctx.load_texture(format!("thumb:{path}"), ci, egui::TextureOptions::LINEAR))
+        }
+        Err(_) => Fav::Missing,
+    });
+    match entry {
+        Fav::Ready(t) => Some((t.id(), t.size_vec2())),
+        _ => None,
+    }
+}
+
+/// Rarity colours: under 5% is rare, under 20% uncommon.
+fn rarity_color(pct: f32) -> Color32 {
+    if pct < 5.0 {
+        MAGENTA
+    } else if pct < 20.0 {
+        YELLOW
+    } else {
+        DIM
+    }
 }
 
 /// One "Search everything" result.
@@ -3887,7 +5078,7 @@ fn search_library(lib: &Library, q: &str, limit: usize) -> Vec<SearchHit> {
     };
     let mut out = Vec::new();
     for g in &lib.games {
-        if has(&g.title) || has(&g.platform) || has(&g.resume_note) {
+        if has(&g.title) || has(&g.platform) || has(&g.resume_note) || g.tags.iter().any(|t| has(t)) {
             out.push(SearchHit { game: g.id, guide: None, item: None, title: g.title.clone(), place: format!("Game \u{b7} {}", g.platform), snippet: String::new(), done: false });
         }
         for gd in &g.guides {
@@ -3898,7 +5089,7 @@ fn search_library(lib: &Library, q: &str, limit: usize) -> Vec<SearchHit> {
                 if out.len() >= limit {
                     return out;
                 }
-                let field = [&s.text, &s.detail, &s.how, &s.reward, &s.section].into_iter().find(|t| has(t));
+                let field = [&s.text, &s.detail, &s.how, &s.reward, &s.section, &s.note].into_iter().find(|t| has(t));
                 if let Some(f) = field {
                     let place = if s.section.is_empty() { format!("{} > {}", g.title, gd.title) } else { format!("{} > {} > {}", g.title, gd.title, s.section) };
                     let snippet = if f == &s.text { String::new() } else { snip(f) };
@@ -3944,6 +5135,69 @@ fn match_names(steps: &[Step], text: &str) -> Vec<usize> {
         .collect()
 }
 
+impl Reader {
+    fn new(guide: u64, text: &str) -> Self {
+        // runs of blank lines become one
+        let mut lines: Vec<String> = Vec::new();
+        for l in text.lines() {
+            let l = l.trim_end();
+            if l.trim().is_empty() && lines.last().is_none_or(|p| p.trim().is_empty()) {
+                continue;
+            }
+            lines.push(l.to_string());
+        }
+        Reader { guide, heights: Vec::new(), width: 0.0, lines, target: None, target_key: "-".into(), jump: None, found: Vec::new(), found_at: 0, found_for: String::new() }
+    }
+}
+
+/// A line's height before it has been laid out (about 8 px per character at 16 px).
+fn estimate_line(line: &str, width: f32) -> f32 {
+    if line.trim().is_empty() {
+        return 10.0;
+    }
+    let per_row = (width / 8.0).max(10.0);
+    let rows = (line.chars().count() as f32 / per_row).ceil().max(1.0);
+    rows * if line.starts_with("## ") { 22.0 } else { 19.0 } + 6.0
+}
+
+/// For comparing a page with a checklist: lower case, straight quotes and dashes, single spaces.
+fn norm_text(s: &str) -> String {
+    let s: String = s
+        .to_lowercase()
+        .chars()
+        .map(|c| match c {
+            '\u{2018}' | '\u{2019}' | '\u{2032}' => '\'',
+            '\u{201c}' | '\u{201d}' | '\u{2033}' => '"',
+            '\u{2013}' | '\u{2014}' => '-',
+            c => c,
+        })
+        .collect();
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The line of a guide's text an item is on: its anchor or name, searched for after its area's
+/// heading (so "Chest 1" finds the one in the right area).
+fn find_line(lines: &[String], section: &str, text: &str, anchor: &str) -> Option<usize> {
+    let lower: Vec<String> = lines.iter().map(|l| norm_text(l)).collect();
+    let sec = norm_text(section);
+    let start = if sec.is_empty() { 0 } else { lower.iter().position(|l| l.contains(&sec)).unwrap_or(0) };
+    let mut needles: Vec<String> = Vec::new();
+    // long items (route steps) are often reflowed on the page: their opening words still match
+    let opening: String = text.chars().take(36).collect();
+    for n in [anchor, text, text.split_once(": ").map_or("", |x| x.1), text.strip_prefix('#').and_then(|r| r.split_once(' ')).map_or("", |x| x.1), opening.as_str()] {
+        let n = norm_text(n);
+        if n.chars().count() >= 3 && !needles.contains(&n) {
+            needles.push(n);
+        }
+    }
+    for n in &needles {
+        if let Some(p) = lower[start..].iter().position(|l| l.contains(n.as_str())) {
+            return Some(start + p);
+        }
+    }
+    needles.iter().find_map(|n| lower.iter().position(|l| l.contains(n.as_str())))
+}
+
 /// "2 chests · 1 objective" for the given items.
 fn kind_counts(steps: &[Step], idx: impl Iterator<Item = usize>) -> String {
     let mut n = [0usize; 4];
@@ -3968,10 +5222,10 @@ fn tag(ui: &mut Ui, text: &str, col: Color32) {
 }
 
 /// One checklist item: tick box, type icon, name, requirement, How and Reward.
-/// Clicking anywhere on the row ticks it.
-#[allow(clippy::too_many_arguments)]
-fn step_row(ui: &mut Ui, s: &Step, i: usize, state: StepState, is_next: bool, can_find: bool, compact: bool, open: bool, cursor: bool, acts: &mut Vec<(usize, RowAct)>) -> egui::Response {
-    let has_details = !s.detail.is_empty() || !s.how.is_empty();
+/// Clicking anywhere on the row ticks it (or, for a spoiler-guarded item, shows it).
+fn step_row(ui: &mut Ui, s: &Step, i: usize, look: &RowLook, acts: &mut Vec<(usize, RowAct)>) -> egui::Response {
+    let RowLook { state, is_next, can_find, compact, open, cursor, veiled, thumb } = *look;
+    let has_details = !veiled && (!s.detail.is_empty() || !s.how.is_empty() || !s.note.is_empty() || !s.image.is_empty());
     // compact rows show their details only when opened
     let show_details = !compact || open;
     let done = state == StepState::Done;
@@ -4029,11 +5283,18 @@ fn step_row(ui: &mut Ui, s: &Step, i: usize, state: StepState, is_next: bool, ca
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if can_find && ui.small_button("Find in guide").on_hover_text("Open the guide scrolled to this item").clicked() {
+                                if can_find && !veiled && ui.small_button("Find in guide").on_hover_text("Open the guide scrolled to this item").clicked() {
                                     acts.push((i, RowAct::Find));
                                 }
-                                if !s.reward.is_empty() {
+                                if !s.reward.is_empty() && !veiled {
                                     tag(ui, &format!("Reward: {}", s.reward), if faded { DIM } else { TEAL });
+                                }
+                                if let Some(r) = s.rarity {
+                                    let col = if faded { DIM } else { rarity_color(r) };
+                                    tag(ui, &format!("{r:.1}%"), col);
+                                }
+                                if !s.note.is_empty() && compact && !open && !veiled {
+                                    tag(ui, "note", TEAL);
                                 }
                                 match state {
                                     StepState::Missed => tag(ui, "Missed", Color32::from_rgb(0xE0, 0x60, 0x60)),
@@ -4059,6 +5320,9 @@ fn step_row(ui: &mut Ui, s: &Step, i: usize, state: StepState, is_next: bool, ca
                                     if done {
                                         t = t.strikethrough();
                                     }
+                                    if veiled {
+                                        t = RichText::new("\u{2592}\u{2592}\u{2592}\u{2592}\u{2592}\u{2592}  hidden by the spoiler guard: click to show").font(pixel(if compact { 15.0 } else { 16.0 })).color(DIM);
+                                    }
                                     let label = egui::Label::new(t).selectable(false);
                                     ui.add(if compact && !open { label.truncate() } else { label.wrap() });
                                     if s.hidden {
@@ -4069,6 +5333,7 @@ fn step_row(ui: &mut Ui, s: &Step, i: usize, state: StepState, is_next: bool, ca
                         });
                         // Finished items keep their full height (just dimmed) so nothing below
                         // them slides up under the mouse. "Hide done" removes them instead.
+                        let show_details = show_details && !veiled;
                         if show_details && !s.detail.is_empty() {
                             ui.add(egui::Label::new(RichText::new(&s.detail).color(if faded { DIM } else { YELLOW })).wrap().selectable(false));
                         }
@@ -4077,6 +5342,28 @@ fn step_row(ui: &mut Ui, s: &Step, i: usize, state: StepState, is_next: bool, ca
                             let col = if faded { DIM.gamma_multiply(0.7) } else { DIM };
                             ui.add(egui::Label::new(RichText::new(format!("How: {}", s.how)).color(col)).wrap().selectable(false));
                         }
+                        if show_details && !s.note.is_empty() {
+                            ui.add_space(2.0);
+                            ui.add(egui::Label::new(RichText::new(format!("Note: {}", s.note)).color(if faded { DIM } else { TEAL })).wrap().selectable(false));
+                        }
+                        if show_details && !s.image.is_empty() {
+                            ui.add_space(2.0);
+                            match thumb {
+                                Some((tex, size)) => {
+                                    let h = 120.0f32;
+                                    let w = (size.x / size.y.max(1.0) * h).min(ui.available_width());
+                                    let r = ui
+                                        .add(egui::Image::new((tex, Vec2::new(w, w / size.x.max(1.0) * size.y))).sense(Sense::click()))
+                                        .on_hover_text("Open the full image");
+                                    if r.clicked() {
+                                        acts.push((i, RowAct::OpenImage));
+                                    }
+                                }
+                                None => {
+                                    ui.label(RichText::new(format!("Image not found: {}", s.image)).small().color(MAGENTA));
+                                }
+                            }
+                        }
                     });
                 });
             });
@@ -4084,11 +5371,13 @@ fn step_row(ui: &mut Ui, s: &Step, i: usize, state: StepState, is_next: bool, ca
         .response;
     let resp = if compact && !open && has_details {
         let mut tip = s.detail.clone();
-        if !s.how.is_empty() {
-            if !tip.is_empty() {
-                tip.push_str("\n\n");
+        for (label, text) in [("How", &s.how), ("Note", &s.note)] {
+            if !text.is_empty() {
+                if !tip.is_empty() {
+                    tip.push_str("\n\n");
+                }
+                tip.push_str(&format!("{label}: {text}"));
             }
-            tip.push_str(&format!("How: {}", s.how));
         }
         resp.on_hover_ui(|ui| {
             ui.set_max_width(460.0);
@@ -4101,13 +5390,30 @@ fn step_row(ui: &mut Ui, s: &Step, i: usize, state: StepState, is_next: bool, ca
         glow_rect(ui.painter(), resp.rect, 3.0, MAGENTA, 5.0);
     }
     if resp.clicked() {
-        acts.push((i, RowAct::Toggle));
+        acts.push((i, if veiled { RowAct::Reveal } else { RowAct::Toggle }));
     }
     resp.context_menu(|ui| {
         if ui.button(if done { "Untick" } else { "Tick off" }).clicked() {
             acts.push((i, RowAct::Toggle));
             ui.close_menu();
         }
+        if veiled && ui.button("Show it (spoiler guard)").clicked() {
+            acts.push((i, RowAct::Reveal));
+            ui.close_menu();
+        }
+        if ui.button(if s.note.is_empty() { "Add a note\u{2026}" } else { "Edit the note\u{2026}" }).clicked() {
+            acts.push((i, RowAct::Note));
+            ui.close_menu();
+        }
+        if ui.button(if s.image.is_empty() { "Attach an image\u{2026}" } else { "Change the image\u{2026}" }).on_hover_text("A screenshot or map for this item").clicked() {
+            acts.push((i, RowAct::Image));
+            ui.close_menu();
+        }
+        if !s.image.is_empty() && ui.button("Remove the image").clicked() {
+            acts.push((i, RowAct::NoImage));
+            ui.close_menu();
+        }
+        ui.separator();
         let missed_label = if s.missed { "Not missed after all" } else { "Mark as missed / skipped" };
         if !s.missed && missed && !s.deadline.is_empty() {
             ui.label(RichText::new(format!("Past its deadline ({})", s.deadline)).small().color(DIM));
@@ -4291,6 +5597,7 @@ mod tests {
             log: (0..5).map(|i| LogEntry { at: 1_700_000_000 + i * 86_400, text: "Session notes that are fairly long. ".repeat(4) }).collect(),
             guides: vec![guide, link],
             game_date: "4/2".into(),
+            tags: vec!["100%".into(), "co-op".into()],
             ..Default::default()
         });
         lib.games.push(Game { id: 4, title: "Fire Emblem: Fortune's Weave".into(), platform: "Switch 2".into(), ..Default::default() });
@@ -4342,7 +5649,7 @@ mod tests {
         let nowhere = std::env::temp_dir().join("jagt-bench-does-not-exist").join("library.json");
         let mut app = App::build(&ctx, saved, lib, nowhere, false, false);
         let size = Vec2::new(1700.0, 1000.0);
-        let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+        let frame = |app: &mut App, events: Vec<egui::Event>| {
             let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)), events, ..Default::default() };
             let out = ctx.run(input, |ctx| app.frame(ctx));
             let _ = ctx.tessellate(out.shapes, out.pixels_per_point);
@@ -4350,7 +5657,7 @@ mod tests {
         for _ in 0..20 {
             frame(&mut app, vec![]);
         }
-        let mut time = |label: &str, app: &mut App, make: &dyn Fn(usize) -> Vec<egui::Event>| {
+        let time = |label: &str, app: &mut App, make: &dyn Fn(usize) -> Vec<egui::Event>| {
             let n = 200;
             let t = Instant::now();
             for k in 0..n {
@@ -4622,7 +5929,7 @@ mod tests {
     fn synced_achievements_tick_or_make_a_checklist() {
         let ctx = egui::Context::default();
         let mut app = app(&ctx);
-        let a = |n: &str, got: bool| accounts::Achievement { name: n.into(), description: format!("About {n}"), achieved: got };
+        let a = |n: &str, got: bool| accounts::Achievement { name: n.into(), description: format!("About {n}"), achieved: got, rarity: if got { Some(50.0) } else { Some(2.5) }, id: String::new() };
         // the sample game has no achievement items: a checklist is made from the platform's list
         let msg = app.apply_achievements(1, Source::Steam, &[a("The Body", true), a("Our Song", false)]);
         assert!(msg.contains("made an achievement checklist with 2 items, 1 already earned"), "{msg}");
@@ -4633,6 +5940,7 @@ mod tests {
         let msg = app.apply_achievements(1, Source::Xbox, &[a("OUR SONG!", true), a("Unknown One", true)]);
         assert!(msg.contains("ticked 1 new") && msg.contains("1 Xbox names didn't match"), "{msg}");
         assert!(app.lib.games[0].guides[gi].steps.iter().all(|s| s.done));
+        assert_eq!(app.lib.games[0].guides[gi].steps[0].rarity, Some(50.0), "rarity comes along");
         // the dashboard and the sync window draw
         app.trophies_open = true;
         run(&mut app, &ctx, Vec2::new(1400.0, 850.0), vec![]);
@@ -4733,5 +6041,227 @@ mod tests {
         // and nothing drawn in a side panel is wider than the panel (it would be cut off)
         let over = OVERFLOW.with(|o| o.get());
         assert!(over <= 0.5, "side panel content is {over:.1}px wider than its panel");
+    }
+
+    /// Every piece of text drawn in a frame, one per line.
+    fn drawn_text(app: &mut App, ctx: &egui::Context, size: Vec2) -> String {
+        fn walk(s: &egui::Shape, out: &mut String) {
+            match s {
+                egui::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|x| walk(x, out)),
+                _ => {}
+            }
+        }
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)), ..Default::default() };
+        let out = ctx.run(input, |ctx| app.frame(ctx));
+        let mut text = String::new();
+        for c in &out.shapes {
+            walk(&c.shape, &mut text);
+        }
+        text
+    }
+
+    #[test]
+    fn hotkey_ticks_the_next_item_and_the_mini_window_shows_it() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let size = Vec2::new(1400.0, 850.0);
+        assert_eq!(app.current_list(), Some((1, 2)));
+        let next = app.lib.games[0].guides[0].next_index(Some((4, 2))).unwrap();
+        let name = app.lib.games[0].guides[0].steps[next].text.clone();
+        app.mini_open = true;
+        let text = drawn_text(&mut app, &ctx, size);
+        assert!(text.contains(&name), "the mini window shows the next item");
+        assert_eq!(app.tick_next().as_deref(), Some(name.as_str()));
+        assert!(app.lib.games[0].guides[0].steps[next].done);
+        app.untick_last();
+        assert!(!app.lib.games[0].guides[0].steps[next].done, "the undo hotkey unticks it");
+        // closing the (embedded) mini window turns it off; drawing it a few times is fine
+        for _ in 0..3 {
+            run(&mut app, &ctx, size, vec![]);
+        }
+        assert!(app.mini_open);
+    }
+
+    #[test]
+    fn play_timer_runs_for_one_game_at_a_time() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        app.start_playing(1);
+        assert!(app.lib.games[0].session_start.is_some());
+        app.lib.games[0].session_start = Some(model::now() - 600);
+        app.start_playing(4);
+        assert!(app.lib.games[0].session_start.is_none(), "starting another game stops the first");
+        assert!(app.lib.games[0].play_secs >= 600);
+        assert!(app.lib.games[0].log.last().unwrap().text.starts_with("Played 10 min"));
+        assert_eq!(app.playing().map(|g| g.id), Some(4));
+        let text = drawn_text(&mut app, &ctx, Vec2::new(1400.0, 850.0));
+        assert!(text.contains("0:00:0"), "the taskbar shows the running timer");
+        app.stop_playing(4);
+        assert!(app.playing().is_none());
+    }
+
+    #[test]
+    fn spoiler_guard_covers_what_comes_after_your_place() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let size = Vec2::new(1400.0, 1600.0);
+        app.view = ViewMode::Checklist;
+        app.hide_done = true;
+        let next = app.lib.games[0].guides[0].next_index(Some((4, 2))).unwrap();
+        let later = app.lib.games[0].guides[0].steps[next + 1].text.clone();
+        let text = drawn_text(&mut app, &ctx, size);
+        assert!(text.contains(&later));
+        app.lib.games[0].spoiler_guard = true;
+        let text = drawn_text(&mut app, &ctx, size);
+        assert!(!text.contains(&later), "later items are covered");
+        assert!(text.contains("hidden by the spoiler guard"));
+        assert!(text.contains(&app.lib.games[0].guides[0].steps[next].text), "the next item isn't");
+        app.revealed.insert((2, next + 1));
+        assert!(drawn_text(&mut app, &ctx, size).contains(&later), "a clicked one shows");
+    }
+
+    #[test]
+    fn notes_images_and_rarity_show_on_items() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let size = Vec2::new(1400.0, 1600.0);
+        app.view = ViewMode::Checklist;
+        let s = &mut app.lib.games[0].guides[0].steps[0];
+        s.note = "Came back after chapter 5".into();
+        s.image = "Z:/nowhere/screenshot.png".into();
+        s.rarity = Some(3.25);
+        let text = drawn_text(&mut app, &ctx, size);
+        assert!(text.contains("Note: Came back after chapter 5"));
+        assert!(text.contains("Image not found"));
+        assert!(text.contains("3.2%"));
+        // Find searches notes
+        assert!(search_library(&app.lib, "chapter 5", 10).iter().any(|h| h.item == Some(0)));
+        // a real image loads as a thumbnail
+        let dir = std::env::temp_dir().join(format!("jagt-thumb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("shot.png");
+        image::RgbaImage::from_pixel(64, 32, image::Rgba([200, 40, 90, 255])).save(&png).unwrap();
+        app.lib.games[0].guides[0].steps[0].image = png.display().to_string();
+        let text = drawn_text(&mut app, &ctx, size);
+        assert!(!text.contains("Image not found"));
+        assert!(matches!(app.thumbs.get(&png.display().to_string()), Some(Fav::Ready(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missables_dashboard_lists_what_you_could_miss() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        app.missables_open = true;
+        let text = drawn_text(&mut app, &ctx, Vec2::new(1400.0, 1200.0));
+        // sample items with a deadline: every third one; those under 12 are done
+        assert!(text.contains("Objective 12: A rather long"), "{text}");
+        assert!(!text.contains("Objective 3: A rather long"), "done items aren't listed");
+        assert!(text.contains("Ends 9/25"));
+        assert!(text.contains("things you could still miss"));
+    }
+
+    #[test]
+    fn tags_filter_the_games_list() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        assert_eq!(app.sorted_ids().len(), 2);
+        app.tag_filter = Some("co-op".into());
+        assert_eq!(app.sorted_ids(), vec![1]);
+        app.tag_filter = None;
+        app.search = "co-op".into();
+        assert_eq!(app.sorted_ids(), vec![1], "search finds tags too");
+        app.search.clear();
+        let text = drawn_text(&mut app, &ctx, Vec2::new(1400.0, 850.0));
+        assert!(text.contains("#co-op"));
+    }
+
+    #[test]
+    fn reader_shows_the_guide_text_at_your_place() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let size = Vec2::new(1500.0, 900.0);
+        let _ = std::fs::remove_dir_all(&app.pages_dir);
+        let mut page = String::from("## Intro\nSome words about the game.\n\n");
+        for a in 0..4 {
+            page.push_str(&format!("## Area {a} (cleared data, part 2)\n"));
+            for i in a * 10..a * 10 + 10 {
+                page.push_str(&format!("Objective {i}: A rather long objective name that keeps going and going\nDo the thing.\n\n"));
+            }
+        }
+        model::save_page(&app.pages_dir, 2, &page).unwrap();
+        app.view = ViewMode::Checklist;
+        app.reader_open = true;
+        let next = app.lib.games[0].guides[0].next_index(Some((4, 2))).unwrap();
+        run(&mut app, &ctx, size, vec![]);
+        let text = drawn_text(&mut app, &ctx, size);
+        let r = app.reader.as_ref().expect("the text loaded");
+        let t = r.target.expect("found the item in the text");
+        assert!(r.lines[t].starts_with(&format!("Objective {next}:")), "{}", r.lines[t]);
+        assert!(text.contains("Guide text"));
+        // the reader scrolled there, so the line is drawn
+        assert!(text.contains(&format!("Objective {next}: A rather")));
+        // search
+        app.reader_find = "area 3".into();
+        run(&mut app, &ctx, size, vec![]);
+        assert_eq!(app.reader.as_ref().unwrap().found.len(), 1);
+        let _ = std::fs::remove_dir_all(&app.pages_dir);
+    }
+
+    #[test]
+    fn finding_an_item_in_guide_text() {
+        let lines: Vec<String> = ["## Castle Town", "Chest 1 - Potion", "## Forest", "Chest 1 - Ether", "Objective 14: Frozen Rail Ride"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(find_line(&lines, "Forest", "Chest 1", ""), Some(3), "the one in the item's area");
+        assert_eq!(find_line(&lines, "", "Objective 14: Frozen Rail Ride", ""), Some(4));
+        assert_eq!(find_line(&lines, "Castle Town", "Achievement: Frozen Rail Ride", ""), Some(4), "the name after a prefix");
+        assert_eq!(find_line(&lines, "", "Nowhere", ""), None);
+    }
+
+    #[test]
+    fn new_run_window_draws_and_starts_a_run() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        app.run_window = Some((1, "NG+".into(), HashSet::new(), true));
+        run(&mut app, &ctx, Vec2::new(1400.0, 850.0), vec![]);
+        assert!(app.run_window.is_some());
+        app.lib.games[0].new_run("NG+", &[], true, model::now());
+        let text = drawn_text(&mut app, &ctx, Vec2::new(1400.0, 850.0));
+        assert!(text.contains("NG+"), "the Run menu shows the new run");
+        assert!(app.lib.games[0].guides[0].steps.iter().all(|s| !s.done));
+    }
+}
+
+#[cfg(test)]
+mod reader_check {
+    /// `JAGT_PAGE=page.txt cargo test reader_finds_items -- --ignored --nocapture`: how many of a
+    /// real page's checklist items the reader can find in its text.
+    #[test]
+    #[ignore]
+    fn reader_finds_items() {
+        let Ok(path) = std::env::var("JAGT_PAGE") else { return };
+        for p in path.split(';') {
+            let text = std::fs::read_to_string(p).unwrap();
+            let r = super::Reader::new(1, &text);
+            let steps = crate::checklist::parse(&text);
+            let mut miss = Vec::new();
+            let mut order_ok = 0;
+            let mut last = 0;
+            for s in &steps {
+                match super::find_line(&r.lines, &s.section, &s.text, &s.anchor) {
+                    Some(l) => {
+                        if l >= last {
+                            order_ok += 1;
+                        }
+                        last = l;
+                    }
+                    None => miss.push(s.text.clone()),
+                }
+            }
+            println!("{p}: {} items, {} found, {} in page order; missed {:?}", steps.len(), steps.len() - miss.len(), order_ok, miss.iter().take(5).collect::<Vec<_>>());
+        }
     }
 }
