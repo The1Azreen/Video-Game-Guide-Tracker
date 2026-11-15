@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
+use crate::accounts::{self, Achievement, Source};
 use crate::links;
 
 pub enum Job {
@@ -13,12 +14,22 @@ pub enum Job {
     Favicon { host: String },
     /// The readable text of a guide page, for turning into a checklist.
     PageText { guide: u64, url: String },
+    /// Check an account: Steam (key + profile) or Xbox (key).
+    CheckAccount { source: Source, key: String, profile: String },
+    /// Find a game on a platform: Steam store app id / Xbox title id.
+    FindGame { game: u64, source: Source, key: String, title: String },
+    /// Pull your achievements for a game.
+    Sync { game: u64, source: Source, key: String, user: String, id: String },
 }
 
 pub enum Done {
     Title { game: u64, guide: u64, title: Option<String> },
     Favicon { host: String, image: Option<egui::ColorImage> },
     PageText { guide: u64, text: Result<String, String> },
+    /// (id, display name): SteamID64 + profile name, or gamertag for Xbox.
+    Account { source: Source, result: Result<(String, String), String> },
+    FoundGame { game: u64, source: Source, result: Result<(String, String), String> },
+    Achievements { game: u64, source: Source, result: Result<Vec<Achievement>, String> },
 }
 
 pub struct Online {
@@ -43,6 +54,32 @@ impl Online {
                         Done::Favicon { host, image }
                     }
                     Job::PageText { guide, url } => Done::PageText { guide, text: page_text(&agent, &url) },
+                    Job::CheckAccount { source, key, profile } => Done::Account {
+                        source,
+                        result: match source {
+                            Source::Steam => accounts::steam_resolve(&agent, &key, &profile),
+                            Source::Xbox => accounts::xbox_account(&agent, &key).map(|tag| (tag.clone(), tag)),
+                        },
+                    },
+                    Job::FindGame { game, source, key, title } => Done::FoundGame {
+                        game,
+                        source,
+                        result: match source {
+                            Source::Steam => accounts::steam_find_app(&agent, &title).map(|(id, name)| (id.to_string(), name)),
+                            Source::Xbox => accounts::xbox_find_title(&agent, &key, &title),
+                        },
+                    },
+                    Job::Sync { game, source, key, user, id } => Done::Achievements {
+                        game,
+                        source,
+                        result: match source {
+                            Source::Steam => match id.trim().parse::<u32>() {
+                                Ok(app) => accounts::steam_achievements(&agent, &key, &user, app),
+                                Err(_) => Err("The Steam app ID should be a number.".into()),
+                            },
+                            Source::Xbox => accounts::xbox_achievements(&agent, &key, &id),
+                        },
+                    },
                 };
                 if done.send(result).is_err() {
                     break;

@@ -7,6 +7,7 @@ use egui::{Align, Align2, Color32, Key, Layout, Pos2, Rect, RichText, Sense, Str
 
 use crate::icons;
 use crate::links;
+use crate::accounts::{self, Source};
 use crate::checklist;
 use crate::model::{self, Folder, Game, Guide, Kind, Library, LogEntry, Status, Step, StepKind, StepState};
 use crate::online::{self, Done, Job, Online};
@@ -43,6 +44,13 @@ struct Saved {
     compact_rows: bool,
     /// Which windows get the space.
     view: ViewMode,
+    /// Achievement sync accounts (kept only in the local settings file).
+    steam_key: String,
+    steam_profile: String,
+    steam_id: String,
+    steam_name: String,
+    xbox_key: String,
+    xbox_tag: String,
     /// Reopen the explorer where it was left.
     explorer_open: bool,
     ex_path: Vec<String>,
@@ -52,7 +60,7 @@ struct Saved {
 
 impl Default for Saved {
     fn default() -> Self {
-        Saved { filter: None, selected: None, online: true, glow: true, animate: true, folder_view: true, closed_folders: Vec::new(), ex_layout: ExplorerLayout::Icons, compact_rows: false, view: ViewMode::All, explorer_open: false, ex_path: Vec::new(), window_size: None, maximized: false }
+        Saved { filter: None, selected: None, online: true, glow: true, animate: true, folder_view: true, closed_folders: Vec::new(), ex_layout: ExplorerLayout::Icons, compact_rows: false, view: ViewMode::All, steam_key: String::new(), steam_profile: String::new(), steam_id: String::new(), steam_name: String::new(), xbox_key: String::new(), xbox_tag: String::new(), explorer_open: false, ex_path: Vec::new(), window_size: None, maximized: false }
     }
 }
 
@@ -143,6 +151,19 @@ pub struct App {
     compact_rows: bool,
     /// All windows, or just one of them using the whole space (Focus = just the Checklist).
     view: ViewMode,
+    steam_key: String,
+    steam_profile: String,
+    steam_id: String,
+    steam_name: String,
+    xbox_key: String,
+    xbox_tag: String,
+    /// Result of the last account check.
+    account_note: String,
+    /// The "Sync achievements" window, for this game.
+    sync_window: Option<u64>,
+    sync_note: String,
+    /// The Trophies dashboard is showing.
+    trophies_open: bool,
     /// Compact rows whose details are opened, by (guide, item).
     open_rows: HashSet<(u64, usize)>,
     /// The explorer window is showing (instead of the selected game).
@@ -250,6 +271,16 @@ impl App {
             ex_layout: saved.ex_layout,
             compact_rows: saved.compact_rows,
             view: saved.view,
+            steam_key: saved.steam_key,
+            steam_profile: saved.steam_profile,
+            steam_id: saved.steam_id,
+            steam_name: saved.steam_name,
+            xbox_key: saved.xbox_key,
+            xbox_tag: saved.xbox_tag,
+            account_note: String::new(),
+            sync_window: None,
+            sync_note: String::new(),
+            trophies_open: false,
             open_rows: HashSet::new(),
             explorer_open: saved.explorer_open,
             ex_path: saved.ex_path,
@@ -471,6 +502,37 @@ impl App {
                     };
                     self.favicons.insert(host, fav);
                 }
+                Done::Account { source, result } => match (source, result) {
+                    (Source::Steam, Ok((id, name))) => {
+                        self.account_note = format!("Steam: signed in as {name}");
+                        self.steam_id = id;
+                        self.steam_name = name;
+                    }
+                    (Source::Xbox, Ok((_, tag))) => {
+                        self.account_note = format!("Xbox: signed in as {tag}");
+                        self.xbox_tag = tag;
+                    }
+                    (s, Err(e)) => self.account_note = format!("{}: {e}", s.label()),
+                },
+                Done::FoundGame { game, source, result } => match result {
+                    Ok((id, name)) => {
+                        if let Some(g) = self.lib.game_mut(game) {
+                            match source {
+                                Source::Steam => g.steam_app = id.clone(),
+                                Source::Xbox => g.xbox_title = id.clone(),
+                            }
+                        }
+                        self.sync_note = format!("{}: found \"{name}\" ({id}). Check it's the right game, then Sync.", source.label());
+                    }
+                    Err(e) => self.sync_note = format!("{}: {e}", source.label()),
+                },
+                Done::Achievements { game, source, result } => {
+                    self.sync_note = match result {
+                        Ok(list) => self.apply_achievements(game, source, &list),
+                        Err(e) => format!("{}: {e}", source.label()),
+                    };
+                    self.set_status(self.sync_note.clone());
+                }
                 Done::PageText { guide, text } => {
                     // only if the paste window is still open for that guide
                     if let Some((gid, buf)) = &mut self.bulk {
@@ -637,6 +699,11 @@ impl App {
             ui.add_space(10.0);
             if explorer_icon(ui, self.explorer_open).clicked() {
                 self.explorer_open = !self.explorer_open;
+                self.trophies_open = false;
+            }
+            if trophies_icon(ui, self.trophies_open).clicked() {
+                self.trophies_open = !self.trophies_open;
+                self.explorer_open = false;
             }
             ui.add_space(14.0);
             // one compact dropdown, so the header fits on narrower windows
@@ -655,6 +722,7 @@ impl App {
                         if ui.selectable_label(self.view == v && !self.explorer_open, v.label()).on_hover_text(tip).clicked() {
                             self.view = v;
                             self.explorer_open = false;
+                            self.trophies_open = false;
                         }
                     }
                 })
@@ -836,6 +904,7 @@ impl App {
     fn game_header(&mut self, ui: &mut Ui, gid: u64) {
         let now = self.time();
         let mut delete = false;
+        let mut sync = false;
         let Some(g) = self.lib.game_mut(gid) else { return };
         ui.add(egui::TextEdit::singleline(&mut g.title).font(bold(24.0)).desired_width(f32::INFINITY).frame(false).hint_text("Game title"));
         ui.horizontal(|ui| {
@@ -879,6 +948,9 @@ impl App {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 delete = armed_button(ui, ("del-game", gid), "Delete game", now);
+                if ui.button("Sync achievements\u{2026}").on_hover_text("Tick earned achievements from Steam or Xbox").clicked() {
+                    sync = true;
+                }
             });
         });
         ui.add_space(2.0);
@@ -897,6 +969,10 @@ impl App {
             });
             ui.label(RichText::new(info.join(" · ")).small().color(DIM));
         });
+        if sync {
+            self.sync_window = Some(gid);
+            self.sync_note.clear();
+        }
         if delete {
             let title = g.title.clone();
             self.lib.games.retain(|g| g.id != gid);
@@ -2223,6 +2299,240 @@ impl App {
         }
     }
 
+    /// Ticks the achievements a platform says you've earned. A game with no achievement checklist
+    /// gets one made from the platform's list. Returns a summary for the user.
+    fn apply_achievements(&mut self, game: u64, source: Source, list: &[accounts::Achievement]) -> String {
+        let new_id = self.lib.new_id();
+        let Some(g) = self.lib.game_mut(game) else { return "That game is gone.".into() };
+        let earned = list.iter().filter(|a| a.achieved).count();
+        if let Some(gi) = g.trophy_guide() {
+            let guide = &mut g.guides[gi];
+            let mut ticked = 0;
+            let mut unmatched = 0;
+            for a in list {
+                let k = accounts::key(&a.name);
+                let hit = guide.steps.iter_mut().find(|s| {
+                    s.kind == StepKind::Achievement && (accounts::key(&s.text) == k || s.text.split_once(": ").is_some_and(|(_, r)| accounts::key(r) == k))
+                });
+                match hit {
+                    Some(s) if a.achieved => {
+                        if !s.done {
+                            ticked += 1;
+                        }
+                        s.done = true;
+                    }
+                    Some(_) => {}
+                    None => unmatched += 1,
+                }
+            }
+            let title = guide.title.clone();
+            let mut msg = format!("{}: {earned} of {} earned; ticked {ticked} new in \"{title}\".", source.label(), list.len());
+            if unmatched > 0 {
+                msg.push_str(&format!(" {unmatched} {} names didn't match an item.", source.label()));
+            }
+            msg
+        } else {
+            let url = match source {
+                Source::Steam => format!("https://steamcommunity.com/stats/{}/achievements", g.steam_app.trim()),
+                Source::Xbox => "https://www.xbox.com/en-US/play/achievements".to_string(),
+            };
+            let steps: Vec<Step> = list
+                .iter()
+                .map(|a| Step { kind: StepKind::Achievement, detail: a.description.clone(), done: a.achieved, section: "Achievements".into(), anchor: a.name.clone(), ..Step::task(a.name.clone()) })
+                .collect();
+            let mut guide = Guide::new(new_id, url);
+            guide.title = format!("{} achievements ({})", source.label(), g.title);
+            guide.auto_title = false;
+            guide.kind = Kind::Trophy;
+            guide.steps = steps;
+            g.guides.push(guide);
+            format!("{}: made an achievement checklist with {} items, {earned} already earned.", source.label(), list.len())
+        }
+    }
+
+    fn sync_window(&mut self, ctx: &egui::Context) {
+        let Some(gid) = self.sync_window else { return };
+        let Some(game) = self.lib.games.iter().find(|g| g.id == gid) else {
+            self.sync_window = None;
+            return;
+        };
+        let title = game.title.clone();
+        let (mut steam_app, mut xbox_title) = (game.steam_app.clone(), game.xbox_title.clone());
+        let steam_ready = !self.steam_key.trim().is_empty() && !self.steam_id.is_empty();
+        let xbox_ready = !self.xbox_key.trim().is_empty();
+        let mut open = true;
+        let mut jobs: Vec<Job> = Vec::new();
+        let mut to_settings = false;
+        egui::Window::new(RichText::new(format!("Sync achievements: {title}")).font(bold(18.0)))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(520.0)
+            .pivot(Align2::CENTER_CENTER)
+            .default_pos(ctx.screen_rect().center())
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("Earned achievements get ticked in this game's trophy checklist. If it has none, one is made from the platform's list. Nothing gets unticked.")
+                        .small()
+                        .color(DIM),
+                );
+                let section = |ui: &mut Ui, label: &str| {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(label).font(bold(16.0)).color(TEAL));
+                };
+                section(ui, "Steam");
+                if steam_ready {
+                    ui.horizontal(|ui| {
+                        ui.label("App ID");
+                        ui.add(egui::TextEdit::singleline(&mut steam_app).id_salt("steam-app").desired_width(90.0).hint_text("e.g. 2679460"));
+                        if ui.button("Find on Steam").clicked() {
+                            jobs.push(Job::FindGame { game: gid, source: Source::Steam, key: String::new(), title: title.clone() });
+                        }
+                        if ui.add_enabled(!steam_app.trim().is_empty(), egui::Button::new(RichText::new("Sync from Steam").font(bold(15.0)))).clicked() {
+                            jobs.push(Job::Sync { game: gid, source: Source::Steam, key: self.steam_key.clone(), user: self.steam_id.clone(), id: steam_app.clone() });
+                        }
+                    });
+                    ui.label(RichText::new(format!("As {}", self.steam_name)).small().color(DIM));
+                } else if ui.link("Add your Steam key and profile in Settings \u{25b8} Accounts").clicked() {
+                    to_settings = true;
+                }
+                section(ui, "Xbox (OpenXBL)");
+                if xbox_ready {
+                    ui.horizontal(|ui| {
+                        ui.label("Title ID");
+                        ui.add(egui::TextEdit::singleline(&mut xbox_title).id_salt("xbox-title").desired_width(110.0).hint_text("found for you"));
+                        if ui.button("Find on Xbox").clicked() {
+                            jobs.push(Job::FindGame { game: gid, source: Source::Xbox, key: self.xbox_key.clone(), title: title.clone() });
+                        }
+                        if ui.add_enabled(!xbox_title.trim().is_empty(), egui::Button::new(RichText::new("Sync from Xbox").font(bold(15.0)))).clicked() {
+                            jobs.push(Job::Sync { game: gid, source: Source::Xbox, key: self.xbox_key.clone(), user: String::new(), id: xbox_title.clone() });
+                        }
+                    });
+                } else if ui.link("Add your OpenXBL key in Settings \u{25b8} Accounts").clicked() {
+                    to_settings = true;
+                }
+                ui.add_space(6.0);
+                ui.label(RichText::new("PlayStation has no public trophy API: copy your trophy list (PSNProfiles or the PS5) and use Checklist \u{25b8} \u{2026} \u{25b8} Tick from a list.").small().color(DIM));
+                if !self.sync_note.is_empty() {
+                    ui.separator();
+                    ui.label(RichText::new(&self.sync_note).color(YELLOW));
+                }
+            });
+        if let Some(g) = self.lib.game_mut(gid) {
+            g.steam_app = steam_app.trim().to_string();
+            g.xbox_title = xbox_title.trim().to_string();
+        }
+        if !jobs.is_empty() && !self.online_on {
+            self.sync_note = "Turn Online on to sync achievements.".into();
+            jobs.clear();
+        }
+        for j in jobs {
+            self.sync_note = "Working\u{2026}".into();
+            self.online.send(j);
+        }
+        if to_settings {
+            self.show_settings = true;
+        }
+        if !open {
+            self.sync_window = None;
+            self.sync_note.clear();
+        }
+    }
+
+    /// Every game's trophy progress in one place, closest to complete first.
+    fn trophies_view(&mut self, ui: &mut Ui) {
+        struct Row {
+            game: u64,
+            guide: u64,
+            title: String,
+            platform: String,
+            done: usize,
+            total: usize,
+            left: Vec<(String, bool)>,
+        }
+        let mut rows: Vec<Row> = self
+            .lib
+            .games
+            .iter()
+            .filter_map(|g| {
+                let gd = &g.guides[g.trophy_guide()?];
+                let ach: Vec<&Step> = gd.steps.iter().filter(|s| s.kind == StepKind::Achievement && !s.optional).collect();
+                Some(Row {
+                    game: g.id,
+                    guide: gd.id,
+                    title: g.title.clone(),
+                    platform: g.platform.clone(),
+                    done: ach.iter().filter(|s| s.done).count(),
+                    total: ach.len(),
+                    left: ach.iter().filter(|s| !s.done).map(|s| (s.text.clone(), s.detail.starts_with("Missable"))).collect(),
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            let fa = a.done as f32 / a.total.max(1) as f32;
+            let fb = b.done as f32 / b.total.max(1) as f32;
+            // unfinished first, closest to done at the top; finished at the bottom
+            (a.done == a.total).cmp(&(b.done == b.total)).then(fb.total_cmp(&fa))
+        });
+        let mut open: Option<(u64, u64)> = None;
+        let mut sync: Option<u64> = None;
+        let earned: usize = rows.iter().map(|r| r.done).sum();
+        let total: usize = rows.iter().map(|r| r.total).sum();
+        ui.label(RichText::new(format!("{earned} of {total} trophies & achievements across {} games", rows.len())).font(bold(18.0)).color(YELLOW));
+        if rows.is_empty() {
+            ui.label(RichText::new("No game has a trophy checklist yet. Add a trophy guide, or use Sync achievements on a game.").color(DIM));
+        }
+        ui.add_space(6.0);
+        egui::ScrollArea::vertical().id_salt("trophies").auto_shrink([false, false]).show(ui, |ui| {
+            for r in &rows {
+                egui::Frame::new().fill(CARD_BG).stroke(Stroke::new(1.0f32, if r.done == r.total { GREEN } else { INDIGO })).corner_radius(3).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        let (ir, _) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
+                        icons::trophy(ui.painter(), ir, if r.done == r.total { GREEN } else { YELLOW });
+                        ui.label(RichText::new(&r.title).font(bold(17.0)).color(WHITE));
+                        ui.label(RichText::new(&r.platform).small().color(DIM));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("Sync\u{2026}").on_hover_text("Pull earned achievements from Steam or Xbox").clicked() {
+                                sync = Some(r.game);
+                            }
+                            if ui.button("Open checklist").clicked() {
+                                open = Some((r.game, r.guide));
+                            }
+                            ui.label(RichText::new(format!("{} / {}", r.done, r.total)).font(bold(16.0)).color(if r.done == r.total { GREEN } else { YELLOW }));
+                        });
+                    });
+                    let (bar, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 8.0), Sense::hover());
+                    rail(ui, bar.shrink2(Vec2::new(0.0, 1.0)), r.done as f32 / r.total.max(1) as f32, false, ("trophy-bar", r.game));
+                    if !r.left.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.label(RichText::new(format!("{} left:", r.left.len())).small().color(TEAL));
+                            for (name, missable) in r.left.iter().take(12) {
+                                tag(ui, name, if *missable { MAGENTA } else { DIM });
+                            }
+                            if r.left.len() > 12 {
+                                ui.label(RichText::new(format!("+{} more", r.left.len() - 12)).small().color(DIM));
+                            }
+                        });
+                    }
+                });
+                ui.add_space(6.0);
+            }
+        });
+        if let Some((game, guide)) = open {
+            self.selected = Some(game);
+            self.active_list = Some(guide);
+            self.trophies_open = false;
+            self.left_view = false;
+            self.list_section = None;
+            self.list_search.clear();
+        }
+        if let Some(game) = sync {
+            self.sync_window = Some(game);
+            self.sync_note.clear();
+        }
+    }
+
     fn tick_list_window(&mut self, ctx: &egui::Context) {
         let Some((gid, text, mode)) = &mut self.tick_list else { return };
         let guide_id = *gid;
@@ -2338,6 +2648,54 @@ impl App {
                     self.favicons.clear();
                     self.set_status("Icon cache cleared");
                 }
+
+                heading(ui, "Accounts (achievement sync)");
+                ui.label(RichText::new("Used by Sync achievements on each game. Stored only in this PC's settings file.").small().color(DIM));
+                egui::Grid::new("accounts").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                    ui.label(RichText::new("Steam API key").color(TEAL));
+                    ui.add(egui::TextEdit::singleline(&mut self.steam_key).password(true).desired_width(240.0).hint_text("from steamcommunity.com/dev/apikey"));
+                    ui.end_row();
+                    ui.label(RichText::new("Steam profile").color(TEAL));
+                    ui.add(egui::TextEdit::singleline(&mut self.steam_profile).desired_width(240.0).hint_text("profile link or 17-digit SteamID"));
+                    ui.end_row();
+                    ui.label(RichText::new("OpenXBL key").color(TEAL));
+                    ui.add(egui::TextEdit::singleline(&mut self.xbox_key).password(true).desired_width(240.0).hint_text("from xbl.io after signing in"));
+                    ui.end_row();
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(!self.steam_key.trim().is_empty() && !self.steam_profile.trim().is_empty(), egui::Button::new("Check Steam")).clicked() {
+                        if self.online_on {
+                            self.account_note = "Checking Steam\u{2026}".into();
+                            self.online.send(Job::CheckAccount { source: Source::Steam, key: self.steam_key.trim().to_string(), profile: self.steam_profile.trim().to_string() });
+                        } else {
+                            self.account_note = "Turn Online on first.".into();
+                        }
+                    }
+                    if ui.add_enabled(!self.xbox_key.trim().is_empty(), egui::Button::new("Check Xbox")).clicked() {
+                        if self.online_on {
+                            self.account_note = "Checking Xbox\u{2026}".into();
+                            self.online.send(Job::CheckAccount { source: Source::Xbox, key: self.xbox_key.trim().to_string(), profile: String::new() });
+                        } else {
+                            self.account_note = "Turn Online on first.".into();
+                        }
+                    }
+                    ui.hyperlink_to(RichText::new("Get a Steam key").small(), "https://steamcommunity.com/dev/apikey");
+                    ui.hyperlink_to(RichText::new("Get an OpenXBL key").small(), "https://xbl.io");
+                });
+                let mut linked = Vec::new();
+                if !self.steam_name.is_empty() {
+                    linked.push(format!("Steam: {}", self.steam_name));
+                }
+                if !self.xbox_tag.is_empty() {
+                    linked.push(format!("Xbox: {}", self.xbox_tag));
+                }
+                if !linked.is_empty() {
+                    ui.label(RichText::new(format!("Linked \u{2014} {}", linked.join(" \u{b7} "))).small().color(GREEN));
+                }
+                if !self.account_note.is_empty() {
+                    ui.label(RichText::new(&self.account_note).small().color(YELLOW));
+                }
+                ui.label(RichText::new("PlayStation: no public trophy API. Paste your trophy list with Checklist \u{25b8} \u{2026} \u{25b8} Tick from a list.").small().color(DIM));
 
                 heading(ui, "Your data");
                 ui.label(RichText::new(self.lib_path.display().to_string()).small().color(YELLOW));
@@ -2516,7 +2874,7 @@ impl App {
         };
         // a title-bar button clicked this frame: (which window, which button)
         let mut win: Option<(ViewMode, WinButton)> = None;
-        if let Some(gid) = gid.filter(|_| !self.explorer_open && view == ViewMode::All) {
+        if let Some(gid) = gid.filter(|_| !self.explorer_open && !self.trophies_open && view == ViewMode::All) {
             egui::SidePanel::right("journal").resizable(true).default_width(330.0).width_range(260.0..=520.0).frame(pad).show(ctx, |ui| {
                 contained(ui, |ui| {
                     if let (_, Some(b)) = window_ctl(ui, "Where I Left Off", false, |ui| self.resume_view(ui, gid)) {
@@ -2533,6 +2891,9 @@ impl App {
         egui::CentralPanel::default().frame(pad).show(ctx, |ui| match gid {
             _ if self.explorer_open => {
                 window(ui, "Explorer", |ui| self.explorer_view(ui));
+            }
+            _ if self.trophies_open => {
+                window(ui, "Trophies", |ui| self.trophies_view(ui));
             }
             Some(gid) if view != ViewMode::All => {
                 // one window gets all the space
@@ -2616,6 +2977,7 @@ impl App {
         self.bulk_window(ctx);
         self.tick_list_window(ctx);
         self.search_all_window(ctx);
+        self.sync_window(ctx);
         self.settings_window(ctx);
         self.autosave(had_input || pumped);
         self.watch_file(now);
@@ -2649,6 +3011,12 @@ impl eframe::App for App {
             ex_layout: self.ex_layout,
             compact_rows: self.compact_rows,
             view: self.view,
+            steam_key: self.steam_key.clone(),
+            steam_profile: self.steam_profile.clone(),
+            steam_id: self.steam_id.clone(),
+            steam_name: self.steam_name.clone(),
+            xbox_key: self.xbox_key.clone(),
+            xbox_tag: self.xbox_tag.clone(),
             explorer_open: self.explorer_open,
             ex_path: self.ex_path.clone(),
             window_size: self.window_size.map(|s| [s.x, s.y]),
@@ -3286,6 +3654,21 @@ fn game_menu(ui: &mut Ui, id: u64, status: Status, folder: Option<Folder>, platf
             ui.close_menu();
         }
     }
+}
+
+/// The header's Trophies icon: the dashboard of every game's trophy progress.
+fn trophies_icon(ui: &mut Ui, active: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(66.0, 56.0), Sense::click());
+    let p = ui.painter();
+    if active || resp.hovered() {
+        p.rect_filled(rect, 3.0, if active { INDIGO } else { white_a(10) });
+        p.rect_stroke(rect, 3.0, Stroke::new(1.0f32, if active { YELLOW } else { TEAL }), StrokeKind::Inside);
+    }
+    let ic = Rect::from_center_size(rect.center_top() + Vec2::new(0.0, 19.0), Vec2::splat(28.0));
+    icons::trophy(p, ic, MAGENTA);
+    let fg = if active { YELLOW } else if resp.hovered() { TEAL } else { WHITE };
+    p.text(rect.center_bottom() - Vec2::new(0.0, 3.0), Align2::CENTER_BOTTOM, "Trophies", pixel(14.0), fg);
+    resp.on_hover_text("Every game's trophy and achievement progress in one place")
 }
 
 /// The header's Explorer icon, next to the status icons.
@@ -4156,6 +4539,29 @@ mod tests {
         assert_eq!(app.lib.games[0].guides[0].steps[second].done, !was, "Space toggles the highlighted item");
         run(&mut app, &ctx, size, vec![key(Key::ArrowUp)]);
         assert_eq!(app.list_cursor.unwrap().1, first);
+    }
+
+    #[test]
+    fn synced_achievements_tick_or_make_a_checklist() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let a = |n: &str, got: bool| accounts::Achievement { name: n.into(), description: format!("About {n}"), achieved: got };
+        // the sample game has no achievement items: a checklist is made from the platform's list
+        let msg = app.apply_achievements(1, Source::Steam, &[a("The Body", true), a("Our Song", false)]);
+        assert!(msg.contains("made an achievement checklist with 2 items, 1 already earned"), "{msg}");
+        let g = &app.lib.games[0];
+        let gi = g.trophy_guide().unwrap();
+        assert_eq!(g.guides[gi].steps.iter().map(|s| (s.text.as_str(), s.done)).collect::<Vec<_>>(), [("The Body", true), ("Our Song", false)]);
+        // syncing again ticks matches in that checklist, ignoring case and punctuation
+        let msg = app.apply_achievements(1, Source::Xbox, &[a("OUR SONG!", true), a("Unknown One", true)]);
+        assert!(msg.contains("ticked 1 new") && msg.contains("1 Xbox names didn't match"), "{msg}");
+        assert!(app.lib.games[0].guides[gi].steps.iter().all(|s| s.done));
+        // the dashboard and the sync window draw
+        app.trophies_open = true;
+        run(&mut app, &ctx, Vec2::new(1400.0, 850.0), vec![]);
+        app.trophies_open = false;
+        app.sync_window = Some(1);
+        run(&mut app, &ctx, Vec2::new(1400.0, 850.0), vec![]);
     }
 
     #[test]

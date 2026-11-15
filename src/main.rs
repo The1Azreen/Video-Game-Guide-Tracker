@@ -2,6 +2,7 @@
 // The command-line options below borrow the terminal's console instead; see `use_parent_console`.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod accounts;
 mod app;
 mod checklist;
 mod icons;

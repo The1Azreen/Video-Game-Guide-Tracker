@@ -401,6 +401,9 @@ pub struct Game {
     pub game_date: String,
     /// Explorer folder chosen by hand; `None` = worked out from the platform.
     pub folder: Option<Folder>,
+    /// For achievement sync: the game's Steam app id and Xbox title id (found automatically or typed).
+    pub steam_app: String,
+    pub xbox_title: String,
 }
 
 impl Game {
@@ -410,6 +413,18 @@ impl Game {
 
     pub fn today(&self) -> Option<(u32, u32)> {
         parse_md(&self.game_date)
+    }
+
+    /// The guide holding this game's trophy / achievement list: the one with the most achievement
+    /// items (if any).
+    pub fn trophy_guide(&self) -> Option<usize> {
+        self.guides
+            .iter()
+            .enumerate()
+            .map(|(i, g)| (i, g.steps.iter().filter(|s| s.kind == StepKind::Achievement).count()))
+            .filter(|(_, n)| *n > 0)
+            .max_by_key(|(_, n)| *n)
+            .map(|(i, _)| i)
     }
 
     pub fn has_deadlines(&self) -> bool {
