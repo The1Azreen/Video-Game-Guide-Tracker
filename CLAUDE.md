@@ -36,8 +36,20 @@ The exe has no console in any build (`windows_subsystem = "windows"`); `--help`,
 `--html-to-text` attach to the terminal's console to print. The user runs `target\release\jagt.exe`, so
 rebuild with `cargo build --release` after changes.
 
+## Importing and accounts
+
+- `checklist::parse` recognises: emoji-marked guides (KH), quest blocks with From/End lines (Fire Emblem),
+  numbered items (`Quest #12`, `Gold Beetle #3:`), counted collectibles (`Miman - 5`), `Name - how` reward
+  lines, `|`-separated trophy lists (PowerPyx), and plain lists. When changing it, re-run it on real pages
+  (`--html-to-text` then `--parse-checklist`) and compare counts; it's easy to fix one site and break another.
+- `accounts.rs`: Steam Web API and OpenXBL. Response parsing is unit-tested on sample JSON; the live calls
+  need the user's keys. Keys live only in `jagt-data/settings.ron` (gitignored).
+- Box art comes from Wikipedia's pageimages API with `pilicense=any`, and is only accepted from a page whose
+  title matches the game.
+
 ## Data
 
 The user's library is in `jagt-data/` (gitignored) when run from this repo. Back it up before editing it by
-script, and only write it while the app is closed (`tasklist | grep -i jagt`). Never launch the app on the
+script, and only write it while the app is closed (`tasklist | grep -i jagt`). Daily backups are in
+`jagt-data/backups/`. The user commits to `main` and wants work pushed there. Never launch the app on the
 user's screen to test; use the headless test, or a copy of the exe in a scratch folder with its own `jagt-data/`.

@@ -70,6 +70,21 @@ If you paste a link that already has `&t=95s` or `#range=A40` in it, JAGT keeps 
 - **Continue** (or <kbd>Enter</kbd>): reopens the last guide you used at your saved spot.
 - **Paste anywhere**: <kbd>Ctrl</kbd>+<kbd>V</kbd> with a link copied adds it to the current game.
 - **Online: off** stops all network use. Icons that are already cached still show.
+- **Ticking fast**: right-click an item for **Tick everything before this** ("I'm up to here") or
+  **Untick this and everything after**. **Checklist ▸ … ▸ Tick from a list** takes pasted names
+  (a whole trophy page is fine) and ticks them, ticks everything *except* them, or unticks them.
+- **Keyboard**: in a checklist, <kbd>↑</kbd>/<kbd>↓</kbd> (or <kbd>J</kbd>/<kbd>K</kbd>) move,
+  <kbd>Space</kbd> ticks, <kbd>→</kbd>/<kbd>←</kbd> open and close details, <kbd>F</kbd> is Find in guide.
+- **Find** (<kbd>Ctrl</kbd>+<kbd>F</kbd>) searches every game, guide and checklist item at once.
+- **Trophies**: the header icon shows every game's trophy and achievement progress in one place,
+  closest to complete first, with what's left.
+- **Achievement sync**: **Settings ▸ Accounts** takes a Steam Web API key and profile
+  ([get a key](https://steamcommunity.com/dev/apikey); your profile's *Game details* must be public)
+  and an [OpenXBL](https://xbl.io) key for Xbox. **Sync achievements** on a game then ticks what
+  you've earned, or makes an achievement checklist from the platform's list. PlayStation has no
+  public trophy API: paste your trophy list into **Tick from a list** instead.
+- **Box art** is looked up on Wikipedia and cached; right-click a game's cover to choose an image
+  or turn it off.
 - **Light on your PC**: off-screen checklist items aren't redrawn, and while JAGT isn't the active
   window the stars stop and it redraws about once a second. **Settings ▸ Animated background**
   turns the drifting stars off entirely.
@@ -82,7 +97,8 @@ Everything is saved automatically to `library.json`:
 - Built and run from this repo (`cargo run`): `jagt-data/library.json` in the repo, which is gitignored
 - Portable mode: put a `jagt-data` folder next to the `.exe` (or put "portable" in the exe's name)
 
-The previous version is kept as `library.bak.json`. Settings also has **Export** and **Import**,
+The previous version is kept as `library.bak.json`, and the first save each day also goes to
+`backups/library-YYYY-MM-DD.json` (the last 14 days are kept; **Settings ▸ Your data** restores one). Settings also has **Export** and **Import**,
 which add the games from another library to this one.
 
 ## Building
