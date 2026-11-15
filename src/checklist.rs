@@ -63,6 +63,11 @@ fn looks_structured(text: &str) -> bool {
             || t.starts_with("Reward:")
             || t.starts_with("End:")
             || t.starts_with("Objective:")
+            || t.starts_with("Task:")
+            || t.starts_with("Requirements:")
+            || t.starts_with("Rewards:")
+            || numbered(t).is_some()
+            || counted(t).is_some()
             || chest_number(t).is_some()
             || t.starts_with("Objective ") && t[10..].starts_with(|c: char| c.is_ascii_digit())
     })
@@ -99,7 +104,135 @@ fn is_heading(line: &str) -> bool {
 }
 
 /// Lines that describe the item above them (quest-style guides).
-const FIELDS: [&str; 8] = ["From:", "Available:", "Objective:", "Location:", "End:", "Deadline:", "Ends:", "Start:"];
+const FIELDS: [&str; 12] = [
+    "From:", "Available:", "Objective:", "Location:", "End:", "Deadline:", "Ends:", "Start:", "Task:", "Requirements:", "Client:", "Walkthrough:",
+];
+
+/// "Quest #12 More's Task", "Subquest #2: No Stone Unturned", "Gold Beetle #3: Grand Trad"
+/// → ("Quest", "12", "More's Task"). The label is a short capitalised name.
+fn numbered(line: &str) -> Option<(String, String, String)> {
+    let at = line.find(" #")?;
+    let label = line[..at].trim();
+    let ok_label = (1..=30).contains(&label.len())
+        && label.starts_with(|c: char| c.is_uppercase())
+        && label.chars().all(|c| c.is_alphabetic() || c == ' ' || c == '\'' || c == '-');
+    if !ok_label {
+        return None;
+    }
+    let after = &line[at + 2..];
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let rest = after[digits.len()..].trim_start_matches([':', ' ', '-', '\u{2013}']).trim();
+    Some((label.to_string(), digits, rest.to_string()))
+}
+
+/// "Miman - 5", "Demon Statue Anzu \u{2013} 1" → ("Miman", "5")
+fn counted(line: &str) -> Option<(String, String)> {
+    let digits: String = line.chars().rev().take_while(|c| c.is_ascii_digit()).collect::<Vec<_>>().into_iter().rev().collect();
+    if digits.is_empty() || digits.len() > 4 {
+        return None;
+    }
+    let head = line[..line.len() - digits.len()].trim_end();
+    let label = head.strip_suffix(" -").or_else(|| head.strip_suffix(" \u{2013}"))?.trim();
+    let ok = (3..=40).contains(&label.len())
+        && label.starts_with(|c: char| c.is_uppercase())
+        && label.split(' ').count() <= 5
+        && label.chars().all(|c| c.is_alphanumeric() || c == ' ' || c == '\'' || c == '-');
+    ok.then(|| (label.to_string(), digits))
+}
+
+/// Page furniture that isn't guide content: bylines ("October 10, 2024 by LuckySlime 1 Comment")
+/// and comment timestamps ("June 15, 2024 at 4:57 pm").
+fn is_page_noise(line: &str) -> bool {
+    const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    let Some(rest) = MONTHS.iter().find_map(|m| line.strip_prefix(m).and_then(|r| r.strip_prefix(' '))) else { return false };
+    // "10, 2024 by ..." / "15, 2024 at 4:57 pm"
+    let mut parts = rest.splitn(3, ' ');
+    let day = parts.next().unwrap_or("").trim_end_matches(',');
+    let year = parts.next().unwrap_or("");
+    let tail = parts.next().unwrap_or("");
+    day.chars().all(|c| c.is_ascii_digit()) && year.len() == 4 && year.chars().all(|c| c.is_ascii_digit()) && (tail.starts_with("by ") || tail.starts_with("at "))
+}
+
+/// "Brute Talisman - Complete Subquest Talisman Hunt" → ("Brute Talisman", "Complete Subquest Talisman Hunt"):
+/// a collectible's name, then how to get it.
+fn named_collectible(line: &str) -> Option<(String, String)> {
+    let (name, how) = line.split_once(" \u{2013} ").or_else(|| line.split_once(" - "))?;
+    let name = name.trim();
+    let ok = (3..=40).contains(&name.len())
+        && name.starts_with(|c: char| c.is_uppercase())
+        && name.split(' ').count() <= 5
+        && !how.trim().is_empty()
+        // "Chest 1 - Potion; ..." is the numbered-chest format, handled separately
+        && !name.ends_with(|c: char| c.is_ascii_digit())
+        // "Return to Miman - ..." is an instruction, not an item
+        && !["Return", "Go", "Head", "Talk", "Find", "Collect", "Get", "Bring", "Take", "Use", "Visit", "Speak", "Enter", "Open"]
+            .iter()
+            .any(|v| name.split(' ').next() == Some(*v))
+        && kind_for_label(name) == StepKind::Chest;
+    ok.then(|| (name.to_string(), how.trim().to_string()))
+}
+
+/// What a numbered or counted label is: collectibles show as chests, trophies and endings as achievements.
+fn kind_for_label(label: &str) -> StepKind {
+    let l = label.to_lowercase();
+    if ["trophy", "achievement", "ending"].iter().any(|k| l.contains(k)) {
+        StepKind::Achievement
+    } else if ["chest", "beetle", "collectible", "miman", "statue", "husk", "amalgam", "abscess", "bead", "feather", "relic", "treasure", "talisman", "periapt", "memento", "record", "card"]
+        .iter()
+        .any(|k| l.contains(k))
+    {
+        StepKind::Chest
+    } else {
+        StepKind::Task
+    }
+}
+
+/// PowerPyx-style trophy lists: blocks separated by "|" lines, alternating
+/// [name, description] and [how to get it]. `None` unless the text is mostly that.
+fn trophy_blocks(text: &str) -> Option<Vec<Step>> {
+    if text.lines().filter(|l| l.trim() == "|").count() < 6 {
+        return None;
+    }
+    let mut blocks: Vec<Vec<String>> = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    for l in text.lines().map(str::trim) {
+        if l == "|" {
+            if !cur.is_empty() {
+                blocks.push(std::mem::take(&mut cur));
+            }
+        } else if !l.is_empty() && !l.starts_with("## ") {
+            cur.push(display(l));
+        }
+    }
+    if !cur.is_empty() {
+        blocks.push(cur);
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < blocks.len() {
+        let b = &blocks[i];
+        if b.len() >= 2 && b[0].len() < 70 && !b[0].ends_with('.') {
+            let how = blocks.get(i + 1).map(|h| h.join(" ")).unwrap_or_default();
+            let missable = how.to_lowercase().contains("missable");
+            out.push(Step {
+                anchor: b[0].clone(),
+                text: b[0].clone(),
+                kind: StepKind::Achievement,
+                section: "Trophies".into(),
+                detail: if missable { format!("Missable. {}", b[1]) } else { b[1].clone() },
+                how: how.replace("\u{bb} ", "See: "),
+                ..Default::default()
+            });
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    (out.len() >= 3).then_some(out)
+}
 
 fn is_field(line: &str) -> bool {
     FIELDS.iter().any(|f| line.starts_with(f))
@@ -124,6 +257,9 @@ pub fn parse_headings(text: &str) -> Vec<Step> {
 }
 
 pub fn parse(text: &str) -> Vec<Step> {
+    if let Some(trophies) = trophy_blocks(text) {
+        return trophies;
+    }
     if !looks_structured(text) {
         // plain list; "## " lines (from a fetched page) become areas
         let mut section = String::new();
@@ -146,7 +282,15 @@ pub fn parse(text: &str) -> Vec<Step> {
     let mut parent = String::new();
     // Whether the last item can still take detail lines.
     let mut open = false;
-    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    // stop at the page's comments, and skip bylines and comment dates
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .take_while(|l| !matches!(*l, "## Comments" | "## Leave a Reply" | "## Leave a Comment"))
+        .filter(|l| !l.is_empty() && !is_page_noise(l))
+        .collect();
+    // the item just added from a numbered/counted line still wants its description
+    let mut wants_description = false;
     for (li, raw) in lines.iter().enumerate() {
         let explicit_heading = raw.strip_prefix("## ");
         let line = explicit_heading.unwrap_or(raw).trim();
@@ -166,6 +310,9 @@ pub fn parse(text: &str) -> Vec<Step> {
             }
         };
 
+        if explicit_heading.is_some() || is_field(line) {
+            wants_description = false;
+        }
         if let Some(h) = explicit_heading {
             section = heading(h);
             parent = section.clone();
@@ -174,6 +321,19 @@ pub fn parse(text: &str) -> Vec<Step> {
             if let Some(cur) = out.last_mut().filter(|_| open) {
                 match field {
                     "Objective:" => cur.detail = format!("Objective: {}", display(rest)),
+                    "Task:" | "Requirements:" => {
+                        if !cur.detail.is_empty() {
+                            cur.detail.push(' ');
+                        }
+                        cur.detail.push_str(&display(rest));
+                    }
+                    "Client:" => cur.how = format!("Client: {}. {}", display(rest), cur.how).trim().to_string(),
+                    "Walkthrough:" => {
+                        if !cur.how.is_empty() {
+                            cur.how.push(' ');
+                        }
+                        cur.how.push_str(&display(rest));
+                    }
                     "End:" | "Deadline:" | "Ends:" => {
                         if let Some(d) = first_date(rest) {
                             cur.deadline = d;
@@ -188,7 +348,36 @@ pub fn parse(text: &str) -> Vec<Step> {
                     }
                 }
             }
-        } else if next_is_field && !is_field(line) && !line.starts_with("- ") && !["Reward:", "How:", "Note:"].iter().any(|p| bare.starts_with(p)) {
+        } else if wants_description && !is_field(line) && !line.starts_with("## ") && numbered(&bare).is_none() && counted(&bare).is_none() {
+            // the line right under "Quest #20 ..." describes it ("Automatically accepted on 06/26")
+            wants_description = false;
+            if let Some(cur) = out.last_mut() {
+                if cur.detail.is_empty() {
+                    cur.detail = display(line);
+                } else {
+                    cur.detail = format!("{} {}", cur.detail, display(line));
+                }
+            }
+        } else if let Some((label, n, rest)) = numbered(&bare) {
+            // "Quest #12 More's Task", "Subquest #24: Rite of Resurrection (Missable)"
+            let missable = rest.contains("(Missable)");
+            let main = rest.contains("(MAIN QUEST)");
+            let name = display(&rest.replace("(Missable)", "").replace("(MAIN QUEST)", ""));
+            let text = if name.is_empty() { format!("{label} #{n}") } else { format!("{label} #{n}: {name}") };
+            let detail = if missable { "Missable." } else if main { "Main quest." } else { "" };
+            out.push(Step { anchor: format!("{label} #{n}"), section: section.clone(), kind: kind_for_label(&label), detail: detail.into(), ..Step::task(text) });
+            open = true;
+            wants_description = true;
+        } else if let Some((label, n)) = counted(&bare) {
+            // "Miman - 5": its location follows on the next line
+            out.push(Step { anchor: format!("{label} - {n}"), section: section.clone(), kind: kind_for_label(&label), ..Step::task(format!("{label} {n}")) });
+            open = true;
+            wants_description = true;
+        } else if let Some((name, how)) = named_collectible(&bare).filter(|_| !trophy && !objective) {
+            // "Brute Talisman - Complete Subquest Talisman Hunt"
+            out.push(Step { anchor: name.clone(), section: section.clone(), kind: StepKind::Chest, detail: display(&how), ..Step::task(display(&name)) });
+            open = true;
+        } else if next_is_field && !is_field(line) && !line.starts_with("- ") && !line.ends_with('.') && !["Reward:", "Rewards:", "How:", "Note:"].iter().any(|p| bare.starts_with(p)) {
             // "Hidden Memories" followed by "From: ..." is a quest, not a heading
             let name = display(line);
             out.push(Step { anchor: name.clone(), section: section.clone(), ..Step::task(name) });
@@ -205,7 +394,7 @@ pub fn parse(text: &str) -> Vec<Step> {
             if open {
                 push_how(&mut out, &format!("Note: {}", rest.trim()));
             }
-        } else if let Some(rest) = bare.strip_prefix("Reward:") {
+        } else if let Some(rest) = bare.strip_prefix("Reward:").or_else(|| bare.strip_prefix("Rewards:")) {
             if let Some(cur) = out.last_mut().filter(|_| open) {
                 cur.reward = trim_end_dot(&display(rest)).to_string();
             }
@@ -274,8 +463,11 @@ pub fn parse(text: &str) -> Vec<Step> {
             }
             open = false;
         } else if open {
-            // a stray paragraph (links, extra notes) belongs to the item above
-            push_how(&mut out, line);
+            // text under an item: the first line describes it, the rest is how-to
+            match out.last_mut() {
+                Some(cur) if cur.detail.is_empty() && cur.how.is_empty() => cur.detail = display(line),
+                _ => push_how(&mut out, line),
+            }
         } else if looks_like_list_item(line) {
             // short list-style lines between items ("Find the key"), but not prose
             out.push(Step { section: section.clone(), ..Step::task(plain_item(line)) });
@@ -399,6 +591,50 @@ Reward: Cheshire Cat.
         assert_eq!(fe.iter().map(|x| x.text.as_str()).collect::<Vec<_>>(), ["Lost Hair Clip", "Combat: Battle vs. Bandits"]);
         let plain = parse("## Act 1\n- Find the key\n- Open the door");
         assert_eq!(plain[1].section, "Act 1");
+    }
+
+    #[test]
+    fn numbered_counted_and_trophy_lists() {
+        // PowerPyx quest list (Metaphor)
+        let q = parse("## Side Quests\nQuest #11 Save the Country (MAIN QUEST)\nQuest #14 Pagan\u{2019}s Dilemma\nAccepted from the Mustari Man outside the Inn in Sunshade Row.\nTask: Purchase the Breath of Fresh Air.\nReward: Rusted Accessory, Increases Tolerance (+4)\nSubquest #24: Rite of Resurrection (Missable)\nClient: Neko Shogun\nRequirements: Find 5 Life Stones.\nWalkthrough: Farm them from battles.\nRewards: Wargod Talisman x1");
+        let t: Vec<_> = q.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(t, ["Quest #11: Save the Country", "Quest #14: Pagan's Dilemma", "Subquest #24: Rite of Resurrection"]);
+        assert_eq!(q[0].detail, "Main quest.");
+        assert_eq!(q[1].detail, "Accepted from the Mustari Man outside the Inn in Sunshade Row. Purchase the Breath of Fresh Air.");
+        assert_eq!(q[1].reward, "Rusted Accessory, Increases Tolerance (+4)");
+        assert_eq!(q[2].detail, "Missable. Find 5 Life Stones.");
+        assert_eq!(q[2].how, "Client: Neko Shogun. Farm them from battles.");
+        assert_eq!(q[2].reward, "Wargod Talisman x1");
+
+        // collectibles: numbered (Gold Beetle) and counted (Miman, Demon Statue)
+        let c = parse("## Tamachi\nGold Beetle #1: Northern Border Fort\nOnce you're at the camp, pick it up under a tree.\nMiman \u{2013} 1\nIn front of the very first leyline fount.\nDemon Statue Anzu \u{2013} 1\nAt the very end of this path.");
+        let t: Vec<_> = c.iter().map(|s| (s.text.as_str(), s.kind, s.detail.as_str())).collect();
+        assert_eq!(t, [
+            ("Gold Beetle #1: Northern Border Fort", StepKind::Chest, "Once you're at the camp, pick it up under a tree."),
+            ("Miman 1", StepKind::Chest, "In front of the very first leyline fount."),
+            ("Demon Statue Anzu 1", StepKind::Chest, "At the very end of this path."),
+        ]);
+        assert_eq!(c[0].section, "Tamachi");
+
+        // PowerPyx trophy list
+        let tr = parse("## Trophy Guide\n|\nThe Traveller\nAcquired all trophies.\n|\nEarn all other trophies.\n|\nSummon Mask Time\nCreated all vessels and masks.\n|\nMissable! Collect various items.\n|\nBookworm\nRead every book.\n|\nBuy books in town.\n|");
+        let t: Vec<_> = tr.iter().map(|s| (s.text.as_str(), s.kind)).collect();
+        assert_eq!(t, [("The Traveller", StepKind::Achievement), ("Summon Mask Time", StepKind::Achievement), ("Bookworm", StepKind::Achievement)]);
+        assert_eq!(tr[1].detail, "Missable. Created all vessels and masks.");
+        assert_eq!(tr[2].how, "Buy books in town.");
+    }
+
+    #[test]
+    fn page_furniture_and_reward_lines() {
+        let t = "## Quests\nOctober 10, 2024 by LuckySlime 1 Comment\nQuest #20 Providing a Spark\nAutomatically accepted on 06/26\nTask: Travel to Komero\nReward: Hero's Incense x5\nBrute Talisman \u{2013} Complete Subquest Talisman Hunt\nMiman \u{2013} 1\nIn front of the very first leyline fount.\n## Comments\nGreat guide!\nJune 15, 2024 at 4:57 pm\nQuest #99 Not A Real Quest";
+        let s = parse(t);
+        let names: Vec<_> = s.iter().map(|x| x.text.as_str()).collect();
+        assert_eq!(names, ["Quest #20: Providing a Spark", "Brute Talisman", "Miman 1"]);
+        assert_eq!(s[0].detail, "Automatically accepted on 06/26 Travel to Komero");
+        assert_eq!(s[1].detail, "Complete Subquest Talisman Hunt");
+        assert_eq!(s[1].kind, StepKind::Chest);
+        assert!(is_page_noise("June 15, 2024 at 4:57 pm") && !is_page_noise("June 15 is the deadline"));
+        assert!(named_collectible("Return to Miman \u{2013} 3 and talk to him").is_none());
     }
 
     #[test]
