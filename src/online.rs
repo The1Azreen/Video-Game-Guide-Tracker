@@ -14,6 +14,8 @@ pub enum Job {
     Favicon { host: String },
     /// The readable text of a guide page, for turning into a checklist.
     PageText { guide: u64, url: String },
+    /// A game's box art: a chosen image file, the cached copy, or a Wikipedia lookup.
+    Cover { game: u64, title: String, file: Option<PathBuf>, allow_net: bool },
     /// Check an account: Steam (key + profile) or Xbox (key).
     CheckAccount { source: Source, key: String, profile: String },
     /// Find a game on a platform: Steam store app id / Xbox title id.
@@ -26,6 +28,7 @@ pub enum Done {
     Title { game: u64, guide: u64, title: Option<String> },
     Favicon { host: String, image: Option<egui::ColorImage> },
     PageText { guide: u64, text: Result<String, String> },
+    Cover { game: u64, image: Option<egui::ColorImage> },
     /// (id, display name): SteamID64 + profile name, or gamertag for Xbox.
     Account { source: Source, result: Result<(String, String), String> },
     FoundGame { game: u64, source: Source, result: Result<(String, String), String> },
@@ -54,6 +57,7 @@ impl Online {
                         Done::Favicon { host, image }
                     }
                     Job::PageText { guide, url } => Done::PageText { guide, text: page_text(&agent, &url) },
+                    Job::Cover { game, title, file, allow_net } => Done::Cover { game, image: cover(&agent, game, &title, file.as_deref(), allow_net) },
                     Job::CheckAccount { source, key, profile } => Done::Account {
                         source,
                         result: match source {
@@ -97,6 +101,80 @@ impl Online {
 
 pub fn cache_dir() -> PathBuf {
     crate::model::data_dir().join("cache").join("favicons")
+}
+
+pub fn cover_dir() -> PathBuf {
+    crate::model::data_dir().join("cache").join("covers")
+}
+
+/// Where a game's automatic cover is cached.
+pub fn cover_cache(game: u64) -> PathBuf {
+    cover_dir().join(format!("{game}.img"))
+}
+
+/// Wikipedia asks API clients to identify themselves.
+const WIKI_UA: &str = "JAGT/0.1 (https://github.com/The1Azreen/Video-Game-Guide-Tracker) game-guide-tracker";
+
+fn cover(agent: &ureq::Agent, game: u64, title: &str, file: Option<&std::path::Path>, allow_net: bool) -> Option<egui::ColorImage> {
+    let bytes = if let Some(f) = file {
+        std::fs::read(f).ok()?
+    } else if let Ok(b) = std::fs::read(cover_cache(game)) {
+        b
+    } else {
+        if !allow_net {
+            return None;
+        }
+        let search = format!("{title} video game");
+        let api = format!(
+            "https://en.wikipedia.org/w/api.php?action=query&format=json&generator=search&gsrnamespace=0&gsrlimit=5&prop=pageimages&piprop=thumbnail&pilicense=any&pithumbsize=400&gsrsearch={}",
+            links::percent_encode(&search)
+        );
+        let v: serde_json::Value = agent.get(&api).set("User-Agent", WIKI_UA).call().ok()?.into_json().ok()?;
+        let src = pick_cover(&v, title)?;
+        let mut b = Vec::new();
+        agent.get(&src).set("User-Agent", WIKI_UA).call().ok()?.into_reader().take(6 << 20).read_to_end(&mut b).ok()?;
+        let _ = std::fs::create_dir_all(cover_dir());
+        let _ = std::fs::write(cover_cache(game), &b);
+        b
+    };
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    Some(egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw()))
+}
+
+/// The best-ranked search result that is this game (its page title matches the game's name,
+/// ignoring punctuation and "(video game)"-style suffixes) and has a non-SVG image.
+pub fn pick_cover(v: &serde_json::Value, game_title: &str) -> Option<String> {
+    let pages = v["query"]["pages"].as_object()?;
+    let mut ranked: Vec<&serde_json::Value> = pages.values().collect();
+    ranked.sort_by_key(|p| p["index"].as_i64().unwrap_or(i64::MAX));
+    let want = accounts::key(&deaccent(game_title));
+    ranked
+        .iter()
+        .filter(|p| {
+            let page = p["title"].as_str().unwrap_or("");
+            let page = page.split(" (").next().unwrap_or(page);
+            let k = accounts::key(&deaccent(page));
+            !k.is_empty() && (k == want || want.starts_with(&k) || k.starts_with(&want))
+        })
+        .filter_map(|p| p["thumbnail"]["source"].as_str())
+        .find(|src| !src.to_lowercase().contains(".svg"))
+        .map(str::to_string)
+}
+
+/// "Ōkami" → "Okami", so long-vowel spellings match.
+fn deaccent(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\u{14c}' | '\u{d4}' | '\u{d6}' => 'O',
+            '\u{14d}' | '\u{f4}' | '\u{f6}' => 'o',
+            '\u{16a}' | '\u{db}' => 'U',
+            '\u{16b}' | '\u{fb}' | '\u{fc}' => 'u',
+            '\u{100}' => 'A',
+            '\u{101}' | '\u{e2}' | '\u{e4}' => 'a',
+            '\u{e9}' | '\u{e8}' | '\u{ea}' => 'e',
+            c => c,
+        })
+        .collect()
 }
 
 pub fn clear_cache() {
@@ -369,6 +447,24 @@ mod tests {
             <ul><li>First</li><li>Second &amp; third</li></ul></article><footer>bye</footer></body></html>"#;
         let t = html_to_text(html);
         assert_eq!(t, "## Castle Town\nChest 1 - Potion; on the road.\n\u{2705}Objective 14: Frozen Rail Ride\n- First\n- Second & third");
+    }
+
+    #[test]
+    fn cover_from_wikipedia_search() {
+        let v = serde_json::json!({"query": {"pages": {
+            "200": {"title": "Okami HD (logo)", "index": 1, "thumbnail": {"source": "https://upload.wikimedia.org/x/Okami_logo.svg.png"}},
+            "100": {"title": "Okami", "index": 2, "thumbnail": {"source": "https://upload.wikimedia.org/x/Okami_cover.jpg"}},
+            "300": {"title": "Amaterasu", "index": 3}
+        }}});
+        assert_eq!(pick_cover(&v, "Okami HD").as_deref(), Some("https://upload.wikimedia.org/x/Okami_cover.jpg"), "best-ranked non-logo image of this game");
+        assert!(pick_cover(&serde_json::json!({"batchcomplete": ""}), "Okami").is_none());
+        // a long vowel in the page title still matches; another game's page never does
+        let w = serde_json::json!({"query": {"pages": {
+            "1": {"title": "The Witcher (video game)", "index": 1, "thumbnail": {"source": "https://x/The_Witcher_EU_box.jpg"}},
+            "2": {"title": "\u{14c}kami", "index": 2, "thumbnail": {"source": "https://x/Okami_cover.jpg"}}
+        }}});
+        assert_eq!(pick_cover(&w, "Okami HD").as_deref(), Some("https://x/Okami_cover.jpg"));
+        assert!(pick_cover(&w, "Slay the Princess").is_none(), "no cover beats the wrong game's cover");
     }
 
     #[test]

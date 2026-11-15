@@ -401,6 +401,8 @@ pub struct Game {
     pub game_date: String,
     /// Explorer folder chosen by hand; `None` = worked out from the platform.
     pub folder: Option<Folder>,
+    /// Box art: "" = looked up automatically (Wikipedia), "none" = no cover, else an image file.
+    pub cover: String,
     /// For achievement sync: the game's Steam app id and Xbox title id (found automatically or typed).
     pub steam_app: String,
     pub xbox_title: String,

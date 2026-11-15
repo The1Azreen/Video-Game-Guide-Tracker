@@ -230,6 +230,34 @@ pub fn folder_big(p: &Painter, r: Rect, peek: &[Color32]) {
 
 /// A game case tile: coloured spine band for the platform, the guide site's icon (or a pad) on the
 /// cover, and a strip at the bottom for the status colour.
+/// The UV rectangle that crops an image of `size` to fill `target` (like CSS object-fit: cover).
+pub fn cover_uv(size: Vec2, target: Vec2) -> Rect {
+    let (ia, ta) = (size.x / size.y.max(1.0), target.x / target.y.max(1.0));
+    if ia > ta {
+        let w = ta / ia;
+        Rect::from_min_max(Pos2::new(0.5 - w / 2.0, 0.0), Pos2::new(0.5 + w / 2.0, 1.0))
+    } else {
+        let h = ia / ta;
+        Rect::from_min_max(Pos2::new(0.0, 0.5 - h / 2.0), Pos2::new(1.0, 0.5 + h / 2.0))
+    }
+}
+
+/// A game case: box art filling the cover when there is some, else the guide site's icon.
+pub fn game_case_art(p: &Painter, r: Rect, band: Color32, boxart: Option<(egui::TextureId, Vec2)>, icon: Option<egui::TextureId>, status: Color32) {
+    match boxart {
+        Some((tex, size)) => {
+            p.rect_filled(r, 4.0, Color32::from_rgb(0x2B, 0x27, 0x45));
+            let top = Rect::from_min_size(r.min, Vec2::new(r.width(), 5.0));
+            p.rect_filled(top, 2.0, band);
+            let art = Rect::from_min_max(Pos2::new(r.left() + 2.0, top.bottom()), Pos2::new(r.right() - 2.0, r.bottom() - 7.0));
+            p.image(tex, art, cover_uv(size, art.size()), Color32::WHITE);
+            p.rect_stroke(r, 4.0, Stroke::new(1.5f32, Color32::from_gray(200)), StrokeKind::Inside);
+            p.rect_filled(Rect::from_min_max(Pos2::new(r.left() + 4.0, r.bottom() - 6.0), Pos2::new(r.right() - 4.0, r.bottom() - 3.0)), 1.0, status);
+        }
+        None => game_case(p, r, band, icon, status),
+    }
+}
+
 pub fn game_case(p: &Painter, r: Rect, band: Color32, cover: Option<egui::TextureId>, status: Color32) {
     p.rect_filled(r, 4.0, Color32::from_rgb(0x2B, 0x27, 0x45));
     p.rect_stroke(r, 4.0, Stroke::new(1.5f32, Color32::from_gray(200)), StrokeKind::Inside);

@@ -178,6 +178,8 @@ pub struct App {
     row_heights: HashMap<(u64, usize), (u64, f32)>,
     online: Online,
     favicons: HashMap<String, Fav>,
+    /// Box art by game id (same states as favicons).
+    covers: HashMap<u64, Fav>,
 
     expanded: HashSet<u64>,
     new_url: String,
@@ -290,6 +292,7 @@ impl App {
             row_heights: HashMap::new(),
             online: Online::new(ctx.clone()),
             favicons: HashMap::new(),
+            covers: HashMap::new(),
             expanded: HashSet::new(),
             new_url: String::new(),
             new_log: String::new(),
@@ -502,6 +505,13 @@ impl App {
                     };
                     self.favicons.insert(host, fav);
                 }
+                Done::Cover { game, image } => {
+                    let c = match image {
+                        Some(img) => Fav::Ready(ctx.load_texture(format!("cover:{game}"), img, egui::TextureOptions::LINEAR)),
+                        None => Fav::Missing,
+                    };
+                    self.covers.insert(game, c);
+                }
                 Done::Account { source, result } => match (source, result) {
                     (Source::Steam, Ok((id, name))) => {
                         self.account_note = format!("Steam: signed in as {name}");
@@ -551,6 +561,28 @@ impl App {
             }
         }
         any
+    }
+
+    /// Queues a game's box art: its chosen file, the cached copy, or (online) a Wikipedia lookup.
+    fn want_cover(&mut self, game: u64) {
+        if self.covers.contains_key(&game) {
+            return;
+        }
+        let Some(g) = self.lib.games.iter().find(|g| g.id == game) else { return };
+        if g.cover == "none" {
+            self.covers.insert(game, Fav::Missing);
+            return;
+        }
+        let file = (!g.cover.is_empty()).then(|| PathBuf::from(&g.cover));
+        self.covers.insert(game, Fav::Loading);
+        self.online.send(Job::Cover { game, title: g.title.clone(), file, allow_net: self.online_on });
+    }
+
+    fn cover_of(&self, game: u64) -> Option<(egui::TextureId, Vec2)> {
+        match self.covers.get(&game) {
+            Some(Fav::Ready(t)) => Some((t.id(), t.size_vec2())),
+            _ => None,
+        }
     }
 
     /// Queues favicons for the hosts on screen. Offline, only cached icons are used.
@@ -738,6 +770,7 @@ impl App {
                     self.online_on = !self.online_on;
                     if self.online_on {
                         self.favicons.retain(|_, f| !matches!(f, Fav::Missing));
+                        self.covers.retain(|_, f| !matches!(f, Fav::Missing));
                     }
                 }
                 if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Redo")).on_hover_text("Ctrl+Y").clicked() {
@@ -905,8 +938,39 @@ impl App {
         let now = self.time();
         let mut delete = false;
         let mut sync = false;
+        self.want_cover(gid);
+        let art = self.cover_of(gid);
+        let mut cover_change: Option<String> = None;
+        let mut refetch_cover = false;
         let Some(g) = self.lib.game_mut(gid) else { return };
-        ui.add(egui::TextEdit::singleline(&mut g.title).font(bold(24.0)).desired_width(f32::INFINITY).frame(false).hint_text("Game title"));
+        ui.horizontal(|ui| {
+            // box art thumbnail, with the Cover menu on it
+            let (r, resp) = ui.allocate_exact_size(Vec2::new(30.0, 40.0), Sense::click());
+            icons::game_case_art(ui.painter(), r, platform_color(&g.platform), art, None, g.status.color());
+            let resp = resp.on_hover_text("Cover (right-click for options)");
+            resp.context_menu(|ui| {
+                ui.label(RichText::new("Cover").color(TEAL));
+                if ui.selectable_label(g.cover.is_empty(), "Automatic (Wikipedia)").clicked() {
+                    cover_change = Some(String::new());
+                    ui.close_menu();
+                }
+                if ui.button("Choose image\u{2026}").clicked() {
+                    if let Some(f) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif", "bmp"]).pick_file() {
+                        cover_change = Some(f.display().to_string());
+                    }
+                    ui.close_menu();
+                }
+                if ui.selectable_label(g.cover == "none", "No cover").clicked() {
+                    cover_change = Some("none".into());
+                    ui.close_menu();
+                }
+                if g.cover.is_empty() && ui.button("Look it up again").clicked() {
+                    refetch_cover = true;
+                    ui.close_menu();
+                }
+            });
+            ui.add(egui::TextEdit::singleline(&mut g.title).font(bold(24.0)).desired_width(f32::INFINITY).frame(false).hint_text("Game title"));
+        });
         ui.horizontal(|ui| {
             ui.label(RichText::new("Platform").color(TEAL));
             ui.add(egui::TextEdit::singleline(&mut g.platform).hint_text("PS5, Switch, PC…").desired_width(130.0));
@@ -969,6 +1033,14 @@ impl App {
             });
             ui.label(RichText::new(info.join(" · ")).small().color(DIM));
         });
+        if let Some(c) = cover_change {
+            g.cover = c;
+            self.covers.remove(&gid);
+        }
+        if refetch_cover {
+            let _ = std::fs::remove_file(online::cover_cache(gid));
+            self.covers.remove(&gid);
+        }
         if sync {
             self.sync_window = Some(gid);
             self.sync_note.clear();
@@ -1713,7 +1785,9 @@ impl App {
         drop(games);
         for t in &tiles {
             self.want_favicon(&t.host.clone());
+            self.want_cover(t.id);
         }
+        let boxart: Vec<Option<(egui::TextureId, Vec2)>> = tiles.iter().map(|t| self.cover_of(t.id)).collect();
         let covers: Vec<Option<egui::TextureId>> = tiles
             .iter()
             .map(|t| match self.favicons.get(&t.host) {
@@ -1781,9 +1855,9 @@ impl App {
                                 select = Some(item);
                             }
                         }
-                        for (t, cover) in tiles.iter().zip(&covers) {
+                        for ((t, cover), art) in tiles.iter().zip(&covers).zip(&boxart) {
                             let item = ExplorerItem::Game(t.id);
-                            let r = game_tile(ui, t, *cover, sel.as_ref() == Some(&item));
+                            let r = game_tile(ui, t, *cover, *art, sel.as_ref() == Some(&item));
                             if r.double_clicked() {
                                 open_item = Some(item);
                             } else if r.clicked() {
@@ -2639,12 +2713,15 @@ impl App {
                 }
 
                 heading(ui, "Online");
-                if ui.checkbox(&mut self.online_on, "Look up guide titles and site icons").changed() && self.online_on {
+                if ui.checkbox(&mut self.online_on, "Look up guide titles, site icons and box art").changed() && self.online_on {
                     self.favicons.retain(|_, f| !matches!(f, Fav::Missing));
+                    self.covers.retain(|_, f| !matches!(f, Fav::Missing));
                 }
                 ui.label(RichText::new("Titles come from the page itself (YouTube via oEmbed). Icons come from Google's favicon service and are cached.").small().color(DIM));
-                if ui.button("Clear icon cache").clicked() {
+                if ui.button("Clear icon and cover cache").clicked() {
                     online::clear_cache();
+                    let _ = std::fs::remove_dir_all(online::cover_dir());
+                    self.covers.clear();
                     self.favicons.clear();
                     self.set_status("Icon cache cleared");
                 }
@@ -3541,12 +3618,12 @@ fn folder_tile(ui: &mut Ui, name: &str, count: usize, peek: &[Color32], selected
     resp.on_hover_text(format!("{name} ({count})\nDouble-click to open"))
 }
 
-fn game_tile(ui: &mut Ui, t: &GameTile, cover: Option<egui::TextureId>, selected: bool) -> egui::Response {
+fn game_tile(ui: &mut Ui, t: &GameTile, cover: Option<egui::TextureId>, boxart: Option<(egui::TextureId, Vec2)>, selected: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(TILE, Sense::click());
     let p = ui.painter();
     tile_bg(p, rect, selected, resp.hovered());
     let case = Rect::from_center_size(Pos2::new(rect.center().x, rect.top() + 46.0), Vec2::new(56.0, 74.0));
-    icons::game_case(p, case, platform_color(&t.platform), cover, t.status.color());
+    icons::game_case_art(p, case, platform_color(&t.platform), boxart, cover, t.status.color());
     tile_name(p, rect, case.bottom() + 6.0, &t.title, if selected { YELLOW } else { WHITE });
     let bar = Rect::from_min_max(Pos2::new(rect.left() + 14.0, rect.bottom() - 9.0), Pos2::new(rect.right() - 14.0, rect.bottom() - 5.0));
     p.rect_filled(bar, 1.0, INK);
@@ -4562,6 +4639,21 @@ mod tests {
         app.trophies_open = false;
         app.sync_window = Some(1);
         run(&mut app, &ctx, Vec2::new(1400.0, 850.0), vec![]);
+    }
+
+    #[test]
+    fn cover_crop_fills_the_case() {
+        // a wide image is cropped left and right, a tall one top and bottom
+        let wide = icons::cover_uv(Vec2::new(400.0, 200.0), Vec2::new(50.0, 70.0));
+        assert!(wide.min.y == 0.0 && wide.max.y == 1.0 && wide.min.x > 0.0 && (wide.min.x + wide.max.x - 1.0).abs() < 1e-5);
+        let tall = icons::cover_uv(Vec2::new(100.0, 400.0), Vec2::new(50.0, 70.0));
+        assert!(tall.min.x == 0.0 && tall.max.x == 1.0 && tall.min.y > 0.0);
+        // a game with "No cover" never asks for one
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        app.lib.games[0].cover = "none".into();
+        app.want_cover(1);
+        assert!(matches!(app.covers.get(&1), Some(Fav::Missing)));
     }
 
     #[test]
