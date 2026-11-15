@@ -321,6 +321,23 @@ impl Guide {
         parts.join(" · ")
     }
 
+    /// "I'm up to here": tick every item above `i` (in list order).
+    pub fn tick_before(&mut self, i: usize) {
+        let end = i.min(self.steps.len());
+        for s in &mut self.steps[..end] {
+            s.done = true;
+            s.missed = false;
+        }
+    }
+
+    /// Untick item `i` and every item after it.
+    pub fn untick_from(&mut self, i: usize) {
+        let i = i.min(self.steps.len());
+        for s in &mut self.steps[i..] {
+            s.done = false;
+        }
+    }
+
     pub fn next_step(&self) -> Option<&Step> {
         self.next_index(None).map(|i| &self.steps[i])
     }

@@ -110,6 +110,10 @@ enum CardAct {
 /// What a checklist row asks for.
 enum RowAct {
     Toggle,
+    /// Tick every item above this one (list order).
+    TickBefore,
+    /// Untick this item and every one below it.
+    UntickFrom,
     /// Open or close a compact row's details.
     Details,
     Missed,
@@ -166,6 +170,8 @@ pub struct App {
     bulk_headings: bool,
     /// (hash of text + mode, parsed items) for the paste window's preview.
     bulk_cache: Option<(u64, Vec<Step>)>,
+    /// "Tick from a list": (guide, pasted text, mode).
+    tick_list: Option<(u64, String, TickMode)>,
     active_list: Option<u64>,
     list_kind: Option<StepKind>,
     /// Some(false) = story items only, Some(true) = optional only.
@@ -260,6 +266,7 @@ impl App {
             bulk_error: None,
             bulk_headings: false,
             bulk_cache: None,
+            tick_list: None,
             active_list: None,
             list_kind: None,
             list_scope: None,
@@ -1019,6 +1026,7 @@ impl App {
         // ---- toolbar: which guide, view switch and actions
         let mut paste = false;
         let mut untick = false;
+        let mut tick_list = false;
         let mut clear = false;
         ui.horizontal(|ui| {
             if choices.len() > 1 {
@@ -1040,6 +1048,10 @@ impl App {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.menu_button("…", |ui| {
+                    if ui.button("Tick from a list\u{2026}").on_hover_text("Paste names (e.g. a trophy list from PSNProfiles) and tick the matching items").clicked() {
+                        tick_list = true;
+                        ui.close_menu();
+                    }
                     if ui.button("Untick everything").clicked() {
                         untick = true;
                         ui.close_menu();
@@ -1077,6 +1089,9 @@ impl App {
             });
         });
 
+        if tick_list {
+            self.tick_list = Some((aid, String::new(), TickMode::Named));
+        }
         let compact = self.compact_rows;
         let App { lib, list_kind, list_scope, hide_done, list_search, list_section, left_view, collapsed, scroll_to_next, step_bufs, row_heights, open_rows, .. } = self;
         let Some(game) = lib.game_mut(gid) else { return };
@@ -1384,6 +1399,14 @@ impl App {
                 }
                 RowAct::Delete => {
                     guide.steps.remove(i);
+                }
+                RowAct::TickBefore => {
+                    guide.tick_before(i);
+                    progressed = true;
+                }
+                RowAct::UntickFrom => {
+                    guide.untick_from(i);
+                    progressed = true;
                 }
                 RowAct::Up if i > 0 => guide.steps.swap(i, i - 1),
                 RowAct::Down if i + 1 < guide.steps.len() => guide.steps.swap(i, i + 1),
@@ -2061,6 +2084,81 @@ impl App {
         }
     }
 
+    fn tick_list_window(&mut self, ctx: &egui::Context) {
+        let Some((gid, text, mode)) = &mut self.tick_list else { return };
+        let guide_id = *gid;
+        let Some(guide) = self.lib.games.iter().flat_map(|g| &g.guides).find(|g| g.id == guide_id) else {
+            self.tick_list = None;
+            return;
+        };
+        let matched = match_names(&guide.steps, text);
+        let mut open = true;
+        let mut apply = false;
+        egui::Window::new(RichText::new("Tick from a list").font(bold(18.0)))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(560.0)
+            .pivot(Align2::CENTER_CENTER)
+            .default_pos(ctx.screen_rect().center())
+            .show(ctx, |ui| {
+                ui.label(RichText::new(format!("Checklist: {}", guide.title)).color(TEAL));
+                ui.label(
+                    RichText::new("Paste names, one per line. A whole trophy page from PSNProfiles or the PS5 is fine: descriptions, percentages and rarity lines simply don't match anything.")
+                        .small()
+                        .color(DIM),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.radio_value(mode, TickMode::Named, "Tick the items named");
+                    ui.radio_value(mode, TickMode::AllExcept, "Tick everything except them").on_hover_text("For a list of what you still need, like unearned trophies");
+                    ui.radio_value(mode, TickMode::Untick, "Untick the items named");
+                });
+                egui::ScrollArea::vertical().id_salt("tick-list-text").max_height(220.0).show(ui, |ui| {
+                    ui.add(egui::TextEdit::multiline(text).desired_rows(9).desired_width(f32::INFINITY).hint_text("The Traveller\nClosing the Book\nSummon Mask Time\n..."));
+                });
+                let n = matched.len();
+                let total = guide.steps.len();
+                let effect = match mode {
+                    TickMode::Named => format!("{n} items will be ticked."),
+                    TickMode::AllExcept => format!("{} items will be ticked; the {n} named stay unticked.", total - n),
+                    TickMode::Untick => format!("{n} items will be unticked."),
+                };
+                ui.label(RichText::new(format!("Matched {n} of {total} items. {effect}")).color(if n > 0 { YELLOW } else { DIM }));
+                if n > 0 {
+                    egui::ScrollArea::vertical().id_salt("tick-list-matches").max_height(120.0).show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for &i in &matched {
+                                tag(ui, &guide.steps[i].text, TEAL);
+                            }
+                        });
+                    });
+                }
+                if ui.add_enabled(n > 0, egui::Button::new(RichText::new("Apply").font(bold(16.0)))).clicked() {
+                    apply = true;
+                }
+            });
+        if apply {
+            let mode = *mode;
+            let today = self.lib.games.iter().find(|g| g.guides.iter().any(|x| x.id == guide_id)).and_then(|g| g.today());
+            if let Some(g) = self.lib.games.iter_mut().flat_map(|g| g.guides.iter_mut()).find(|g| g.id == guide_id) {
+                let set: HashSet<usize> = matched.iter().copied().collect();
+                for (i, s) in g.steps.iter_mut().enumerate() {
+                    let named = set.contains(&i);
+                    match mode {
+                        TickMode::Named if named => s.done = true,
+                        TickMode::AllExcept => s.done = !named,
+                        TickMode::Untick if named => s.done = false,
+                        _ => {}
+                    }
+                }
+                g.follow_checklist(today);
+            }
+            self.tick_list = None;
+            self.set_status("Checklist updated (Undo reverts it)");
+        } else if !open {
+            self.tick_list = None;
+        }
+    }
+
     fn close_bulk(&mut self) {
         self.bulk = None;
         self.bulk_cache = None;
@@ -2377,6 +2475,7 @@ impl App {
 
         self.add_game_window(ctx);
         self.bulk_window(ctx);
+        self.tick_list_window(ctx);
         self.settings_window(ctx);
         self.autosave(had_input || pumped);
         self.watch_file(now);
@@ -3163,6 +3262,40 @@ fn row_fingerprint(s: &Step, state: StepState, is_next: bool, can_find: bool, wi
     h.finish()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TickMode {
+    Named,
+    AllExcept,
+    Untick,
+}
+
+/// For matching names: lower case, letters and digits only, single spaces.
+fn name_key(s: &str) -> String {
+    let lowered: String = s
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
+    lowered.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Items whose name appears as a whole line of `text` (ignoring case and punctuation). Item names
+/// like "#12 Pagan's Dilemma" or "Achievement: Shake on It" also match on the part after the prefix.
+fn match_names(steps: &[Step], text: &str) -> Vec<usize> {
+    let lines: HashSet<String> = text.lines().map(name_key).filter(|k| !k.is_empty()).collect();
+    steps
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            let full = name_key(&s.text);
+            let after_prefix = s.text.split_once(": ").map(|(_, rest)| name_key(rest));
+            let after_number = s.text.strip_prefix('#').and_then(|r| r.split_once(' ')).map(|(_, rest)| name_key(rest));
+            lines.contains(&full) || after_prefix.is_some_and(|k| lines.contains(&k)) || after_number.is_some_and(|k| lines.contains(&k))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// "2 chests · 1 objective" for the given items.
 fn kind_counts(steps: &[Step], idx: impl Iterator<Item = usize>) -> String {
     let mut n = [0usize; 4];
@@ -3329,6 +3462,14 @@ fn step_row(ui: &mut Ui, s: &Step, i: usize, state: StepState, is_next: bool, ca
             ui.label(RichText::new(format!("Past its deadline ({})", s.deadline)).small().color(DIM));
         } else if ui.button(missed_label).clicked() {
             acts.push((i, RowAct::Missed));
+            ui.close_menu();
+        }
+        if ui.button("Tick everything before this").on_hover_text("For \"I'm up to here\": ticks every item above this one").clicked() {
+            acts.push((i, RowAct::TickBefore));
+            ui.close_menu();
+        }
+        if ui.button("Untick this and everything after").clicked() {
+            acts.push((i, RowAct::UntickFrom));
             ui.close_menu();
         }
         if ui.button(if s.optional { "Mark as story" } else { "Mark as optional" }).clicked() {
@@ -3760,6 +3901,33 @@ mod tests {
         let at = maximize_button(&ctx, &mut app, size, "Session Log");
         click(&mut app, at);
         assert_eq!(app.view, ViewMode::Notes);
+    }
+
+    #[test]
+    fn tick_from_a_pasted_list() {
+        let st = |t: &str| Step { text: t.into(), ..Default::default() };
+        let steps = vec![st("The Traveller"), st("Shake on It"), st("#14 Pagan's Dilemma"), st("Ending #1: True Ending"), st("Money is Power")];
+        // a PSNProfiles-style paste: names mixed with descriptions, percentages and rarity
+        let paste = "The Traveller\nAcquired all trophies.\n19.18%\nRare\nPlatinum\n\tSHAKE ON IT!\nPagan\u{2019}s Dilemma\ntrue ending\n";
+        assert_eq!(match_names(&steps, paste), vec![0, 1, 2, 3]);
+        assert!(match_names(&steps, "Money").is_empty(), "only whole names match");
+    }
+
+    #[test]
+    fn tick_before_and_untick_from() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let g = &mut app.lib.games[0].guides[0];
+        g.steps.iter_mut().for_each(|s| s.done = false);
+        g.steps[2].missed = true;
+        g.tick_before(5);
+        let done: Vec<bool> = g.steps.iter().take(7).map(|s| s.done).collect();
+        assert_eq!(done, [true, true, true, true, true, false, false]);
+        assert!(!g.steps[2].missed, "ticking clears a manual 'missed'");
+        g.untick_from(3);
+        assert_eq!(g.steps.iter().filter(|s| s.done).count(), 3);
+        g.tick_before(9999); // past the end: everything
+        assert!(g.steps.iter().all(|s| s.done));
     }
 
     #[test]
