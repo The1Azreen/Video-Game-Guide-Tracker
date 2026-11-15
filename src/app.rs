@@ -172,6 +172,10 @@ pub struct App {
     bulk_cache: Option<(u64, Vec<Step>)>,
     /// "Tick from a list": (guide, pasted text, mode).
     tick_list: Option<(u64, String, TickMode)>,
+    /// Keyboard highlight in the checklist: (guide, item).
+    list_cursor: Option<(u64, usize)>,
+    /// "Search everything" window: its text.
+    search_all: Option<String>,
     active_list: Option<u64>,
     list_kind: Option<StepKind>,
     /// Some(false) = story items only, Some(true) = optional only.
@@ -267,6 +271,8 @@ impl App {
             bulk_headings: false,
             bulk_cache: None,
             tick_list: None,
+            list_cursor: None,
+            search_all: None,
             active_list: None,
             list_kind: None,
             list_scope: None,
@@ -592,6 +598,9 @@ impl App {
         if self.view != ViewMode::All && !typing && self.add_game.is_none() && self.bulk.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
             self.view = ViewMode::All;
         }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::F)) {
+            self.search_all = Some(self.search_all.take().unwrap_or_default());
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::N)) {
             self.add_game = Some(NewGame { title: String::new(), platform: String::new(), status: Status::Playing, focus: true });
         }
@@ -688,6 +697,9 @@ impl App {
                     .clicked()
                 {
                     self.pick_files();
+                }
+                if ui.button("Find").on_hover_text("Search every game, guide and checklist (Ctrl+F)").clicked() {
+                    self.search_all = Some(String::new());
                 }
                 if ui.button("+ Add game").on_hover_text("Ctrl+N").clicked() {
                     self.add_game = Some(NewGame { title: String::new(), platform: String::new(), status: Status::Playing, focus: true });
@@ -1093,7 +1105,7 @@ impl App {
             self.tick_list = Some((aid, String::new(), TickMode::Named));
         }
         let compact = self.compact_rows;
-        let App { lib, list_kind, list_scope, hide_done, list_search, list_section, left_view, collapsed, scroll_to_next, step_bufs, row_heights, open_rows, .. } = self;
+        let App { lib, list_kind, list_scope, hide_done, list_search, list_section, left_view, collapsed, scroll_to_next, step_bufs, row_heights, open_rows, list_cursor, .. } = self;
         let Some(game) = lib.game_mut(gid) else { return };
         let Some(guide) = game.guides.iter_mut().find(|g| g.id == aid) else { return };
         if untick {
@@ -1304,6 +1316,57 @@ impl App {
             let scroll_next = std::mem::take(scroll_to_next);
             let mut toggle_section = None;
 
+            // keyboard: a highlight that moves through the items on show
+            let navigable: Vec<usize> = (0..guide.steps.len())
+                .filter(|&i| {
+                    let s = &guide.steps[i];
+                    visible(i, s) && !(!s.section.is_empty() && collapsed.contains(&(aid, s.section.clone())))
+                })
+                .collect();
+            let typing = ui.ctx().memory(|m| m.focused().is_some());
+            let mut cursor_moved = false;
+            if list_cursor.is_some_and(|(g, _)| g != aid) {
+                *list_cursor = None;
+            }
+            if !typing && !navigable.is_empty() {
+                let none = egui::Modifiers::NONE;
+                let (down, up, space, right, left, find) = ui.input_mut(|inp| {
+                    (
+                        inp.consume_key(none, Key::ArrowDown) || inp.consume_key(none, Key::J),
+                        inp.consume_key(none, Key::ArrowUp) || inp.consume_key(none, Key::K),
+                        inp.consume_key(none, Key::Space),
+                        inp.consume_key(none, Key::ArrowRight),
+                        inp.consume_key(none, Key::ArrowLeft),
+                        inp.consume_key(none, Key::F),
+                    )
+                });
+                let pos = list_cursor.and_then(|(_, c)| navigable.iter().position(|&x| x == c));
+                if down || up {
+                    let at = match pos {
+                        Some(p) if down => (p + 1).min(navigable.len() - 1),
+                        Some(p) => p.saturating_sub(1),
+                        None => next.and_then(|n| navigable.iter().position(|&x| x == n)).unwrap_or(0),
+                    };
+                    *list_cursor = Some((aid, navigable[at]));
+                    cursor_moved = true;
+                }
+                if let Some((_, c)) = *list_cursor {
+                    if space {
+                        acts.push((c, RowAct::Toggle));
+                    }
+                    if right {
+                        open_rows.insert((aid, c));
+                    }
+                    if left {
+                        open_rows.remove(&(aid, c));
+                    }
+                    if find && web && !guide.steps[c].anchor.is_empty() {
+                        acts.push((c, RowAct::Find));
+                    }
+                }
+            }
+            let cursor = list_cursor.map(|(_, c)| c);
+
             egui::ScrollArea::vertical().id_salt(("checklist", aid)).auto_shrink([false, false]).show(ui, |ui| {
                 if shown == 0 {
                     ui.add_space(16.0);
@@ -1338,13 +1401,16 @@ impl App {
                     let print = row_fingerprint(s, states[i], is_next, can_find, w, compact, open);
                     if let Some(&(fp, h)) = row_heights.get(&(aid, i)) {
                         let r = Rect::from_min_size(ui.cursor().min, Vec2::new(w, h));
-                        if fp == print && !(is_next && scroll_next) && !ui.is_rect_visible(r) {
+                        if fp == print && !(is_next && scroll_next) && !(cursor_moved && cursor == Some(i)) && !ui.is_rect_visible(r) {
                             ui.allocate_space(Vec2::new(w, h));
                             ui.add_space(4.0);
                             continue;
                         }
                     }
-                    let resp = step_row(ui, s, i, states[i], is_next, can_find, compact, open, &mut acts);
+                    let resp = step_row(ui, s, i, states[i], is_next, can_find, compact, open, cursor == Some(i), &mut acts);
+                    if cursor_moved && cursor == Some(i) {
+                        resp.scroll_to_me(None);
+                    }
                     row_heights.insert((aid, i), (print, resp.rect.height()));
                     if is_next && scroll_next {
                         resp.scroll_to_me(Some(Align::Center));
@@ -2084,6 +2150,79 @@ impl App {
         }
     }
 
+    fn search_all_window(&mut self, ctx: &egui::Context) {
+        let Some(query) = &mut self.search_all else { return };
+        let mut open = true;
+        let mut chosen: Option<SearchHit> = None;
+        let q = query.trim().to_lowercase();
+        let hits = if q.chars().count() >= 2 { search_library(&self.lib, &q, 200) } else { Vec::new() };
+        egui::Window::new(RichText::new("Search everything").font(bold(18.0)))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(640.0)
+            .pivot(Align2::CENTER_CENTER)
+            .default_pos(ctx.screen_rect().center())
+            .show(ctx, |ui| {
+                let r = ui.add(
+                    egui::TextEdit::singleline(query)
+                        .id_salt("search-all")
+                        .hint_text("Search every game, guide and checklist item: \"Martira\", \"Gold Beetle\", \"Paralogue\"...")
+                        .desired_width(f32::INFINITY),
+                );
+                if !r.has_focus() && q.is_empty() {
+                    r.request_focus();
+                }
+                if q.chars().count() < 2 {
+                    ui.label(RichText::new("Type at least 2 letters.").small().color(DIM));
+                    return;
+                }
+                let more = if hits.len() >= 200 { " (showing the first 200)" } else { "" };
+                ui.label(RichText::new(format!("{} results{more}", hits.len())).color(TEAL));
+                egui::ScrollArea::vertical().id_salt("search-all-results").max_height(420.0).show(ui, |ui| {
+                    for h in &hits {
+                        let resp = egui::Frame::new().fill(CARD_BG).corner_radius(2).inner_margin(egui::Margin::symmetric(8, 4)).show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.label(RichText::new(&h.title).font(bold(15.0)).color(if h.done { DIM } else { WHITE }));
+                            ui.label(RichText::new(&h.place).small().color(TEAL));
+                            if !h.snippet.is_empty() {
+                                ui.label(RichText::new(&h.snippet).small().color(DIM));
+                            }
+                        });
+                        let resp = resp.response.interact(Sense::click()).on_hover_text("Open it");
+                        if resp.hovered() {
+                            ui.painter().rect_stroke(resp.rect, 2.0, Stroke::new(1.0f32, TEAL), StrokeKind::Inside);
+                        }
+                        if resp.clicked() {
+                            chosen = Some(h.clone());
+                        }
+                        ui.add_space(3.0);
+                    }
+                });
+            });
+        let term = q.clone();
+        if let Some(h) = chosen {
+            self.selected = Some(h.game);
+            self.explorer_open = false;
+            if matches!(self.view, ViewMode::Game | ViewMode::Guides | ViewMode::Notes) {
+                self.view = ViewMode::All;
+            }
+            if let Some(gid) = h.guide {
+                self.active_list = Some(gid);
+                self.left_view = false;
+                self.list_section = None;
+                self.list_kind = None;
+                self.list_scope = None;
+                self.hide_done = false;
+                // filter the checklist to what was searched for
+                self.list_search = if h.item.is_some() { term } else { String::new() };
+                self.list_cursor = h.item.map(|i| (gid, i));
+            }
+            self.search_all = None;
+        } else if !open {
+            self.search_all = None;
+        }
+    }
+
     fn tick_list_window(&mut self, ctx: &egui::Context) {
         let Some((gid, text, mode)) = &mut self.tick_list else { return };
         let guide_id = *gid;
@@ -2476,6 +2615,7 @@ impl App {
         self.add_game_window(ctx);
         self.bulk_window(ctx);
         self.tick_list_window(ctx);
+        self.search_all_window(ctx);
         self.settings_window(ctx);
         self.autosave(had_input || pumped);
         self.watch_file(now);
@@ -3262,6 +3402,54 @@ fn row_fingerprint(s: &Step, state: StepState, is_next: bool, can_find: bool, wi
     h.finish()
 }
 
+/// One "Search everything" result.
+#[derive(Clone, Debug)]
+struct SearchHit {
+    game: u64,
+    guide: Option<u64>,
+    item: Option<usize>,
+    title: String,
+    /// "Game > Guide > Area"
+    place: String,
+    snippet: String,
+    done: bool,
+}
+
+/// Games, guides and checklist items matching `q` (lower case), up to `limit`.
+fn search_library(lib: &Library, q: &str, limit: usize) -> Vec<SearchHit> {
+    let has = |t: &str| t.to_lowercase().contains(q);
+    let snip = |t: &str| {
+        let lower = t.to_lowercase();
+        let at = lower.find(q).unwrap_or(0);
+        let start = t.char_indices().map(|(i, _)| i).filter(|i| *i <= at.saturating_sub(40)).last().unwrap_or(0);
+        let text: String = t[start..].chars().take(140).collect();
+        if start > 0 { format!("\u{2026}{text}") } else { text }
+    };
+    let mut out = Vec::new();
+    for g in &lib.games {
+        if has(&g.title) || has(&g.platform) || has(&g.resume_note) {
+            out.push(SearchHit { game: g.id, guide: None, item: None, title: g.title.clone(), place: format!("Game \u{b7} {}", g.platform), snippet: String::new(), done: false });
+        }
+        for gd in &g.guides {
+            if has(&gd.title) {
+                out.push(SearchHit { game: g.id, guide: Some(gd.id), item: None, title: gd.title.clone(), place: format!("{} \u{b7} guide", g.title), snippet: String::new(), done: gd.done });
+            }
+            for (i, s) in gd.steps.iter().enumerate() {
+                if out.len() >= limit {
+                    return out;
+                }
+                let field = [&s.text, &s.detail, &s.how, &s.reward, &s.section].into_iter().find(|t| has(t));
+                if let Some(f) = field {
+                    let place = if s.section.is_empty() { format!("{} > {}", g.title, gd.title) } else { format!("{} > {} > {}", g.title, gd.title, s.section) };
+                    let snippet = if f == &s.text { String::new() } else { snip(f) };
+                    out.push(SearchHit { game: g.id, guide: Some(gd.id), item: Some(i), title: s.text.clone(), place, snippet, done: s.done });
+                }
+            }
+        }
+    }
+    out
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TickMode {
     Named,
@@ -3322,7 +3510,7 @@ fn tag(ui: &mut Ui, text: &str, col: Color32) {
 /// One checklist item: tick box, type icon, name, requirement, How and Reward.
 /// Clicking anywhere on the row ticks it.
 #[allow(clippy::too_many_arguments)]
-fn step_row(ui: &mut Ui, s: &Step, i: usize, state: StepState, is_next: bool, can_find: bool, compact: bool, open: bool, acts: &mut Vec<(usize, RowAct)>) -> egui::Response {
+fn step_row(ui: &mut Ui, s: &Step, i: usize, state: StepState, is_next: bool, can_find: bool, compact: bool, open: bool, cursor: bool, acts: &mut Vec<(usize, RowAct)>) -> egui::Response {
     let has_details = !s.detail.is_empty() || !s.how.is_empty();
     // compact rows show their details only when opened
     let show_details = !compact || open;
@@ -3339,7 +3527,10 @@ fn step_row(ui: &mut Ui, s: &Step, i: usize, state: StepState, is_next: bool, ca
             } else {
                 CARD_BG
             };
-            let stroke = if is_next {
+            let stroke = if cursor {
+                // the keyboard highlight
+                Stroke::new(2.5f32, TEAL)
+            } else if is_next {
                 Stroke::new(2.0f32, MAGENTA)
             } else if state == StepState::DueSoon {
                 Stroke::new(1.5f32, MAGENTA.gamma_multiply(0.6))
@@ -3928,6 +4119,43 @@ mod tests {
         assert_eq!(g.steps.iter().filter(|s| s.done).count(), 3);
         g.tick_before(9999); // past the end: everything
         assert!(g.steps.iter().all(|s| s.done));
+    }
+
+    #[test]
+    fn search_everything_finds_items_anywhere() {
+        let ctx = egui::Context::default();
+        let app = app(&ctx);
+        let hits = search_library(&app.lib, "objective 3", 50);
+        assert!(hits.iter().any(|h| h.title.starts_with("Objective 3:") && h.item == Some(3)), "{hits:#?}");
+        let hits = search_library(&app.lib, "fire emblem", 50);
+        assert_eq!(hits.len(), 1);
+        assert_eq!((hits[0].game, hits[0].guide), (4, None));
+        // matches inside How text come with a snippet
+        let hits = search_library(&app.lib, "explanation of how", 3);
+        assert_eq!(hits.len(), 3, "limit respected");
+        assert!(hits[0].snippet.contains("explanation of how"));
+    }
+
+    #[test]
+    fn arrow_keys_move_and_space_ticks() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        let size = Vec2::new(1400.0, 850.0);
+        let key = |k| egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+        for _ in 0..2 {
+            run(&mut app, &ctx, size, vec![]);
+        }
+        // first press lands on the next item to do (item 12 in the sample), then moves down
+        run(&mut app, &ctx, size, vec![key(Key::ArrowDown)]);
+        let first = app.list_cursor.expect("highlight").1;
+        run(&mut app, &ctx, size, vec![key(Key::ArrowDown)]);
+        let second = app.list_cursor.unwrap().1;
+        assert!(second > first, "{first} -> {second}");
+        let was = app.lib.games[0].guides[0].steps[second].done;
+        run(&mut app, &ctx, size, vec![key(Key::Space)]);
+        assert_eq!(app.lib.games[0].guides[0].steps[second].done, !was, "Space toggles the highlighted item");
+        run(&mut app, &ctx, size, vec![key(Key::ArrowUp)]);
+        assert_eq!(app.list_cursor.unwrap().1, first);
     }
 
     #[test]
